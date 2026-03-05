@@ -1,0 +1,69 @@
+"""Aggregate scoring across all metrics."""
+
+from __future__ import annotations
+
+import gc
+
+import open3d as o3d
+
+from vesuvius_mesh_qa.metrics.base import MetricComputer, MetricResult
+from vesuvius_mesh_qa.metrics.triangle import TriangleQualityMetric
+from vesuvius_mesh_qa.metrics.topology import TopologyMetric
+from vesuvius_mesh_qa.metrics.normals import NormalConsistencyMetric, SheetSwitchingMetric
+from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
+from vesuvius_mesh_qa.metrics.noise import NoiseMetric
+
+
+DEFAULT_METRICS: list[type[MetricComputer]] = [
+    TriangleQualityMetric,
+    TopologyMetric,
+    NormalConsistencyMetric,
+    SheetSwitchingMetric,
+    SelfIntersectionMetric,
+    NoiseMetric,
+]
+
+
+def compute_all_metrics(
+    mesh: o3d.geometry.TriangleMesh,
+    weight_overrides: dict[str, float] | None = None,
+) -> list[MetricResult]:
+    """Compute all metrics on a mesh.
+
+    Args:
+        mesh: Open3D triangle mesh with normals computed.
+        weight_overrides: Optional dict of {metric_name: new_weight}.
+
+    Returns:
+        List of MetricResult from each metric.
+    """
+    results = []
+    for metric_cls in DEFAULT_METRICS:
+        metric = metric_cls()
+        if weight_overrides and metric.name in weight_overrides:
+            metric.weight = weight_overrides[metric.name]
+        result = metric.compute(mesh)
+        results.append(result)
+        gc.collect()
+    return results
+
+
+def aggregate_score(results: list[MetricResult]) -> float:
+    """Compute weighted aggregate score from metric results."""
+    total_weight = sum(r.weight for r in results)
+    if total_weight == 0:
+        return 0.0
+    return sum(r.weighted_score for r in results) / total_weight
+
+
+def letter_grade(score: float) -> str:
+    """Convert a 0-1 score to a letter grade."""
+    if score > 0.9:
+        return "A"
+    if score > 0.75:
+        return "B"
+    if score > 0.6:
+        return "C"
+    if score > 0.4:
+        return "D"
+    return "F"

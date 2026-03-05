@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vesuvius-mesh-qa"
+version = "0.1.0"
+description = "Automated mesh quality scoring for Vesuvius Challenge segmentation meshes"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+dependencies = [
+    "open3d>=0.17",
+    "trimesh>=4.0",
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "click>=8.0",
+    "rich>=13.0",
+    "pandas>=2.0",
+    "tqdm>=4.60",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+]
+
+[project.scripts]
+mesh-qa = "vesuvius_mesh_qa.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
