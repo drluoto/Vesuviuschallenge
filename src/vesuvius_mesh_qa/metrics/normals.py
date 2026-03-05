@@ -6,7 +6,7 @@ most critical metric for Vesuvius Challenge scroll segmentation quality.
 
 from __future__ import annotations
 
-from collections import defaultdict, deque
+from collections import deque
 from typing import Any
 
 import numpy as np
@@ -17,80 +17,77 @@ from vesuvius_mesh_qa.metrics.base import MetricComputer, MetricResult
 
 
 # ---------------------------------------------------------------------------
-# Shared helpers
+# Shared helpers (vectorized for large meshes)
 # ---------------------------------------------------------------------------
 
 
-def _build_face_adjacency(
-    triangles: np.ndarray,
-) -> dict[int, set[int]]:
-    """Build a face adjacency map from a triangle array.
+def _build_face_adjacency_sparse(triangles: np.ndarray) -> tuple[sparse.csr_matrix, np.ndarray, np.ndarray]:
+    """Build face adjacency as a sparse matrix using vectorized numpy.
 
-    Two faces are adjacent if they share an edge (i.e. two vertices).
-
-    Args:
-        triangles: (N, 3) int array of vertex indices per face.
+    Handles both manifold edges (2 faces) and non-manifold edges (3+ faces).
 
     Returns:
-        Dictionary mapping face index to the set of adjacent face indices.
+        adj: Sparse CSR binary adjacency matrix (n_faces x n_faces) with self-loops.
+        edge_face_i: Array of face indices for each unique adjacent pair.
+        edge_face_j: Array of face indices for each unique adjacent pair.
     """
-    edge_to_faces: dict[tuple[int, int], list[int]] = defaultdict(list)
-    for face_idx, tri in enumerate(triangles):
-        # Each triangle has three edges; store with sorted vertex order.
-        for i in range(3):
-            edge = tuple(sorted((int(tri[i]), int(tri[(i + 1) % 3]))))
-            edge_to_faces[edge].append(face_idx)
+    n_faces = len(triangles)
 
-    adjacency: dict[int, set[int]] = defaultdict(set)
-    for faces in edge_to_faces.values():
-        if len(faces) == 2:
-            adjacency[faces[0]].add(faces[1])
-            adjacency[faces[1]].add(faces[0])
-        elif len(faces) > 2:
-            # Non-manifold edge — still record all pairings.
-            for i in range(len(faces)):
-                for j in range(i + 1, len(faces)):
-                    adjacency[faces[i]].add(faces[j])
-                    adjacency[faces[j]].add(faces[i])
+    # Build all edges: 3 edges per face, each as sorted (v_min, v_max)
+    face_indices = np.repeat(np.arange(n_faces), 3)
+    v_a = triangles[:, [0, 1, 2]].ravel()
+    v_b = triangles[:, [1, 2, 0]].ravel()
+    edge_min = np.minimum(v_a, v_b)
+    edge_max = np.maximum(v_a, v_b)
 
-    return adjacency
+    # Encode edges as unique integers for grouping
+    max_v = max(int(edge_max.max()), 1) + 1
+    edge_keys = edge_min.astype(np.int64) * max_v + edge_max.astype(np.int64)
+
+    # Sort by edge key to group same edges together
+    sort_idx = np.argsort(edge_keys)
+    sorted_keys = edge_keys[sort_idx]
+    sorted_faces = face_indices[sort_idx]
+
+    # Find all consecutive pairs sharing the same edge key.
+    # For manifold edges (2 faces): one pair. For non-manifold (3+ faces): all pairs.
+    same_as_next = sorted_keys[:-1] == sorted_keys[1:]
+    pair_indices = np.nonzero(same_as_next)[0]
+
+    face_i = sorted_faces[pair_indices]
+    face_j = sorted_faces[pair_indices + 1]
+
+    # For non-manifold edges with 3+ faces sharing an edge, we also need
+    # pairs between non-consecutive entries in the same group.
+    # Detect groups of 3+: where same_as_next[i] and same_as_next[i+1] are both True
+    if len(same_as_next) > 1:
+        triple_mask = same_as_next[:-1] & same_as_next[1:]
+        triple_indices = np.nonzero(triple_mask)[0]
+        if len(triple_indices) > 0:
+            # For each triple, pair first with third: sorted_faces[i] <-> sorted_faces[i+2]
+            extra_i = sorted_faces[triple_indices]
+            extra_j = sorted_faces[triple_indices + 2]
+            face_i = np.concatenate([face_i, extra_i])
+            face_j = np.concatenate([face_j, extra_j])
+
+    # Build sparse adjacency matrix (symmetric + self-loops)
+    rows = np.concatenate([face_i, face_j, np.arange(n_faces)])
+    cols = np.concatenate([face_j, face_i, np.arange(n_faces)])
+    data = np.ones(len(rows), dtype=np.float32)
+    adj = sparse.csr_matrix((data, (rows, cols)), shape=(n_faces, n_faces))
+
+    return adj, face_i, face_j
 
 
 def _compute_face_areas(
     vertices: np.ndarray, triangles: np.ndarray
 ) -> np.ndarray:
-    """Compute per-face areas (vectorized).
-
-    Args:
-        vertices: (V, 3) float array of vertex positions.
-        triangles: (N, 3) int array of vertex indices per face.
-
-    Returns:
-        (N,) float array of triangle areas.
-    """
+    """Compute per-face areas (vectorized)."""
     v0 = vertices[triangles[:, 0]]
     v1 = vertices[triangles[:, 1]]
     v2 = vertices[triangles[:, 2]]
     cross = np.cross(v1 - v0, v2 - v0)
     return 0.5 * np.linalg.norm(cross, axis=1)
-
-
-def _adjacency_to_sparse(
-    adjacency: dict[int, set[int]], n_faces: int
-) -> sparse.csr_matrix:
-    """Convert adjacency dict to a sparse CSR binary matrix."""
-    rows: list[int] = []
-    cols: list[int] = []
-    for face_i, neighbors in adjacency.items():
-        for face_j in neighbors:
-            rows.append(face_i)
-            cols.append(face_j)
-    # Include self-connections so each face's own normal is part of the average.
-    diag = np.arange(n_faces)
-    rows.extend(diag.tolist())
-    cols.extend(diag.tolist())
-    data = np.ones(len(rows), dtype=np.float32)
-    return sparse.csr_matrix((data, (rows, cols)), shape=(n_faces, n_faces))
 
 
 # ---------------------------------------------------------------------------
@@ -99,11 +96,7 @@ def _adjacency_to_sparse(
 
 
 class NormalConsistencyMetric(MetricComputer):
-    """Fraction of adjacent face pairs with small dihedral angle.
-
-    A high score means the mesh surface is locally smooth — adjacent
-    triangles have similar orientations.
-    """
+    """Fraction of adjacent face pairs with small dihedral angle."""
 
     name: str = "normal_consistency"
     weight: float = 0.15
@@ -112,41 +105,29 @@ class NormalConsistencyMetric(MetricComputer):
         triangles = np.asarray(mesh.triangles)
         if len(triangles) == 0:
             return MetricResult(
-                name=self.name,
-                score=0.0,
-                weight=self.weight,
+                name=self.name, score=0.0, weight=self.weight,
                 details={"error": "mesh has no triangles"},
             )
 
         mesh.compute_triangle_normals()
         normals = np.asarray(mesh.triangle_normals)
 
-        adjacency = _build_face_adjacency(triangles)
+        _, face_i, face_j = _build_face_adjacency_sparse(triangles)
 
-        # Collect unique adjacent pairs.
-        seen: set[tuple[int, int]] = set()
-        angles: list[float] = []
-        for face_i, neighbors in adjacency.items():
-            for face_j in neighbors:
-                pair = (min(face_i, face_j), max(face_i, face_j))
-                if pair in seen:
-                    continue
-                seen.add(pair)
-                dot = np.clip(np.dot(normals[face_i], normals[face_j]), -1.0, 1.0)
-                angles.append(np.degrees(np.arccos(dot)))
-
-        if not angles:
+        if len(face_i) == 0:
             return MetricResult(
-                name=self.name,
-                score=1.0,
-                weight=self.weight,
+                name=self.name, score=1.0, weight=self.weight,
                 details={"note": "no adjacent pairs found"},
             )
 
-        angles_arr = np.array(angles)
+        # Vectorized dihedral angle computation
+        dots = np.sum(normals[face_i] * normals[face_j], axis=1)
+        dots = np.clip(dots, -1.0, 1.0)
+        angles_deg = np.degrees(np.arccos(dots))
+
         threshold_deg = 30.0
-        fraction_consistent = float(np.mean(angles_arr < threshold_deg))
-        mean_dihedral = float(np.mean(angles_arr))
+        fraction_consistent = float(np.mean(angles_deg < threshold_deg))
+        mean_dihedral = float(np.mean(angles_deg))
 
         return MetricResult(
             name=self.name,
@@ -169,26 +150,22 @@ class SheetSwitchingMetric(MetricComputer):
 
     Sheet switching is the primary failure mode in automated scroll
     segmentation: a fitted surface follows one papyrus layer and then
-    abruptly transitions to an adjacent layer.  These transitions manifest
-    as clusters of faces whose normals deviate sharply from the local
-    surface orientation.
+    abruptly transitions to an adjacent layer.
 
-    Algorithm
-    ---------
+    Algorithm:
     1. Compute per-face normals.
     2. Build sparse face adjacency matrix.
-    3. Raise adjacency to the 3rd power to obtain 3-ring neighborhoods.
+    3. Raise adjacency to the 3rd power for 3-ring neighborhoods.
     4. Smooth normals by averaging over 3-ring neighborhoods.
-    5. Flag faces whose normal deviates > 45 deg from the smoothed normal.
+    5. Flag faces deviating > 45 deg from smoothed normal.
     6. Cluster flagged faces into connected components.
-    7. Filter clusters with < 20 faces (noise).
-    8. Score = 1 - (flagged area in valid clusters / total area), clamped [0, 1].
+    7. Filter clusters < 20 faces.
+    8. Score = 1 - (flagged area / total area).
     """
 
     name: str = "sheet_switching"
     weight: float = 0.30
 
-    # Tuneable thresholds
     _deviation_threshold_deg: float = 45.0
     _min_cluster_faces: int = 20
 
@@ -198,9 +175,7 @@ class SheetSwitchingMetric(MetricComputer):
 
         if len(triangles) == 0:
             return MetricResult(
-                name=self.name,
-                score=0.0,
-                weight=self.weight,
+                name=self.name, score=0.0, weight=self.weight,
                 details={"error": "mesh has no triangles"},
             )
 
@@ -208,25 +183,20 @@ class SheetSwitchingMetric(MetricComputer):
 
         # Step 1: per-face normals
         mesh.compute_triangle_normals()
-        normals = np.asarray(mesh.triangle_normals).copy()  # (N, 3)
+        normals = np.asarray(mesh.triangle_normals).copy()
 
-        # Step 2: sparse adjacency matrix (including self-loops)
-        adjacency_dict = _build_face_adjacency(triangles)
-        adj = _adjacency_to_sparse(adjacency_dict, n_faces)
+        # Step 2: sparse adjacency matrix (with self-loops)
+        adj, _, _ = _build_face_adjacency_sparse(triangles)
 
         # Step 3: 3-ring neighbourhood via matrix power
-        # A^3 gives reachability within 3 hops.  We binarise at each step
-        # to avoid numerical blow-up and to keep the semantics of
-        # "reachable within 3 edges".
         adj_k = adj.copy()
-        for _ in range(2):  # already have A^1; multiply twice more
+        for _ in range(2):
             adj_k = adj_k.dot(adj)
             adj_k.data[:] = 1.0  # binarise
 
-        # Step 4: smoothed normals via neighbourhood averaging
-        smoothed = adj_k.dot(normals)  # (N, 3) — sum of neighbour normals
+        # Step 4: smoothed normals
+        smoothed = adj_k.dot(normals)
         norms = np.linalg.norm(smoothed, axis=1, keepdims=True)
-        # Avoid division by zero for isolated faces.
         norms = np.maximum(norms, 1e-12)
         smoothed /= norms
 
@@ -240,9 +210,7 @@ class SheetSwitchingMetric(MetricComputer):
 
         if not flagged_indices:
             return MetricResult(
-                name=self.name,
-                score=1.0,
-                weight=self.weight,
+                name=self.name, score=1.0, weight=self.weight,
                 details={
                     "n_switch_regions": 0,
                     "total_switch_area_fraction": 0.0,
@@ -250,7 +218,9 @@ class SheetSwitchingMetric(MetricComputer):
                 },
             )
 
-        # Step 6: cluster flagged faces via BFS connected components
+        # Step 6: cluster flagged faces via BFS using sparse adjacency
+        # Extract adjacency for flagged faces from CSR matrix
+        adj_csr = adj  # already has adjacency info
         clusters: list[list[int]] = []
         remaining = set(flagged_indices)
         while remaining:
@@ -261,7 +231,11 @@ class SheetSwitchingMetric(MetricComputer):
             while queue:
                 current = queue.popleft()
                 cluster.append(current)
-                for neighbor in adjacency_dict.get(current, set()):
+                # Get neighbors from sparse row
+                row_start = adj_csr.indptr[current]
+                row_end = adj_csr.indptr[current + 1]
+                neighbors = adj_csr.indices[row_start:row_end]
+                for neighbor in neighbors:
                     if neighbor in remaining:
                         remaining.discard(neighbor)
                         queue.append(neighbor)
@@ -276,9 +250,7 @@ class SheetSwitchingMetric(MetricComputer):
 
         if total_area <= 0.0:
             return MetricResult(
-                name=self.name,
-                score=0.0,
-                weight=self.weight,
+                name=self.name, score=0.0, weight=self.weight,
                 details={"error": "mesh has zero total area"},
             )
 
@@ -289,8 +261,7 @@ class SheetSwitchingMetric(MetricComputer):
             cluster_arr = np.array(cluster)
             all_problem_faces.extend(cluster)
 
-            # Centroid of the cluster: area-weighted average of face centroids.
-            face_centroids = vertices[triangles[cluster_arr]].mean(axis=1)  # (C, 3)
+            face_centroids = vertices[triangles[cluster_arr]].mean(axis=1)
             cluster_areas = face_areas[cluster_arr]
             total_cluster_area = float(cluster_areas.sum())
             if total_cluster_area > 0:
@@ -301,12 +272,10 @@ class SheetSwitchingMetric(MetricComputer):
             else:
                 centroid = face_centroids.mean(axis=0)
 
-            problem_regions.append(
-                {
-                    "face_count": len(cluster),
-                    "centroid": centroid.tolist(),
-                }
-            )
+            problem_regions.append({
+                "face_count": len(cluster),
+                "centroid": centroid.tolist(),
+            })
 
         flagged_area = float(face_areas[np.array(all_problem_faces)].sum()) if all_problem_faces else 0.0
         switch_area_fraction = flagged_area / total_area
@@ -314,8 +283,7 @@ class SheetSwitchingMetric(MetricComputer):
 
         problem_faces_arr = (
             np.array(sorted(all_problem_faces), dtype=np.int64)
-            if all_problem_faces
-            else None
+            if all_problem_faces else None
         )
 
         return MetricResult(

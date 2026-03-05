@@ -1,12 +1,10 @@
 """Self-intersection detection for mesh quality assessment.
 
-Uses spatial hash partitioning with AABB overlap testing for efficient
-O(n log n) self-intersection detection instead of brute-force O(n^2).
+Uses random sampling with vectorized AABB overlap testing for efficient
+self-intersection detection on large meshes.
 """
 
 from __future__ import annotations
-
-from itertools import product
 
 import numpy as np
 import open3d as o3d
@@ -15,134 +13,110 @@ from vesuvius_mesh_qa.metrics.base import MetricComputer, MetricResult
 from vesuvius_mesh_qa.utils.chunked import voxel_partition_faces
 
 
-def _triangles_share_vertex(tri_a: np.ndarray, tri_b: np.ndarray) -> bool:
-    """Check whether two triangles (each an array of 3 vertex indices) share a vertex."""
-    return len(np.intersect1d(tri_a, tri_b)) > 0
-
-
-def _aabb_overlap(
-    min_a: np.ndarray,
-    max_a: np.ndarray,
-    min_b: np.ndarray,
-    max_b: np.ndarray,
-) -> bool:
-    """Check if two axis-aligned bounding boxes strictly overlap in 3D.
-
-    Uses strict inequality to avoid false positives from coplanar triangles
-    that touch at a boundary but don't actually intersect.
-    """
-    return bool(
-        np.all(min_a < max_b) and np.all(min_b < max_a)
-    )
-
-
-def _check_intersections(
+def _check_intersections_vectorized(
     vertices: np.ndarray,
     triangles: np.ndarray,
     mesh: o3d.geometry.TriangleMesh,
-    sample_size: int = 50_000,
+    sample_size: int = 10_000,
+    neighbors_per_sample: int = 50,
 ) -> tuple[int, float, bool]:
-    """Detect self-intersecting triangle pairs using spatial hashing and AABB tests.
+    """Detect self-intersections by sampling faces and testing nearby non-adjacent faces.
 
-    Parameters
-    ----------
-    vertices : np.ndarray
-        (V, 3) vertex positions.
-    triangles : np.ndarray
-        (F, 3) face vertex indices.
-    mesh : o3d.geometry.TriangleMesh
-        The original mesh, passed through for voxel partitioning.
-    sample_size : int
-        Maximum number of faces to test when the mesh is large.
-
-    Returns
-    -------
-    n_intersecting_pairs : int
-        Number of detected intersecting (AABB-overlapping, non-adjacent) pairs.
-    intersection_fraction : float
-        Fraction of tested faces involved in at least one intersection.
-    was_subsampled : bool
-        Whether random subsampling was applied.
+    For each sampled face, find spatially nearby faces (by centroid distance),
+    exclude adjacent faces, and check AABB overlap.
     """
     n_faces = len(triangles)
     was_subsampled = n_faces > sample_size
 
-    if was_subsampled:
-        rng = np.random.default_rng(42)
-        sampled_indices = set(rng.choice(n_faces, sample_size, replace=False).tolist())
-    else:
-        sampled_indices = None  # use all
-
-    # Precompute per-face AABBs for ALL faces (needed for neighbor lookups).
+    # Compute per-face data
     tri_verts = vertices[triangles]  # (F, 3, 3)
+    centroids = tri_verts.mean(axis=1)  # (F, 3)
     bbox_min = tri_verts.min(axis=1)  # (F, 3)
     bbox_max = tri_verts.max(axis=1)  # (F, 3)
 
-    # Spatial partitioning
-    cells = voxel_partition_faces(mesh, grid_size=8)
+    # Build vertex-to-face adjacency for fast neighbor exclusion
+    # Two faces are adjacent if they share any vertex
+    vert_to_faces: dict[int, list[int]] = {}
+    for fi in range(n_faces):
+        for vi in triangles[fi]:
+            vert_to_faces.setdefault(int(vi), []).append(fi)
 
-    # Precompute neighbor offsets (26-connectivity + self)
-    neighbor_offsets = list(product((-1, 0, 1), repeat=3))
+    # Sample faces
+    rng = np.random.default_rng(42)
+    if was_subsampled:
+        sample_indices = rng.choice(n_faces, sample_size, replace=False)
+    else:
+        sample_indices = np.arange(n_faces)
+
+    # Use spatial partitioning to find nearby faces efficiently
+    cells = voxel_partition_faces(mesh, grid_size=16)
+
+    # Build cell lookup: face_index -> cell_coord
+    face_to_cell: dict[int, tuple[int, int, int]] = {}
+    for coord, face_arr in cells.items():
+        for fi in face_arr:
+            face_to_cell[int(fi)] = coord
 
     intersecting_faces: set[int] = set()
     n_intersecting_pairs = 0
 
-    # For each cell, test faces against faces in the same cell and 26 neighbors.
-    visited_cell_pairs: set[tuple[tuple[int, int, int], tuple[int, int, int]]] = set()
+    for si in sample_indices:
+        si = int(si)
+        cell = face_to_cell.get(si)
+        if cell is None:
+            continue
 
-    for cell_coord, face_indices_a in cells.items():
-        for offset in neighbor_offsets:
-            neighbor_coord = (
-                cell_coord[0] + offset[0],
-                cell_coord[1] + offset[1],
-                cell_coord[2] + offset[2],
-            )
+        # Gather faces in same cell and 26 neighbors
+        candidate_faces: list[int] = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    nc = (cell[0] + dx, cell[1] + dy, cell[2] + dz)
+                    if nc in cells:
+                        candidate_faces.extend(cells[nc].tolist())
 
-            if neighbor_coord not in cells:
-                continue
+        if not candidate_faces:
+            continue
 
-            # Avoid testing the same cell pair twice (order-independent).
-            pair_key = (
-                min(cell_coord, neighbor_coord),
-                max(cell_coord, neighbor_coord),
-            )
-            if pair_key in visited_cell_pairs:
-                continue
-            visited_cell_pairs.add(pair_key)
+        candidates = np.array(candidate_faces)
 
-            face_indices_b = cells[neighbor_coord]
+        # Exclude self and adjacent faces (faces sharing a vertex)
+        adjacent = set()
+        adjacent.add(si)
+        for vi in triangles[si]:
+            for fi in vert_to_faces.get(int(vi), []):
+                adjacent.add(fi)
 
-            for i in face_indices_a:
-                # If subsampled, only test faces in our sample set.
-                if sampled_indices is not None and i not in sampled_indices:
-                    continue
+        mask = np.array([c not in adjacent for c in candidates])
+        candidates = candidates[mask]
 
-                for j in face_indices_b:
-                    if i >= j:
-                        # Avoid self-comparison and duplicate pairs.
-                        continue
+        if len(candidates) == 0:
+            continue
 
-                    # Skip adjacent triangles (sharing a vertex).
-                    if _triangles_share_vertex(triangles[i], triangles[j]):
-                        continue
+        # Limit candidates to avoid quadratic blowup
+        if len(candidates) > neighbors_per_sample:
+            # Pick closest by centroid distance
+            dists = np.linalg.norm(centroids[candidates] - centroids[si], axis=1)
+            top_k = np.argpartition(dists, neighbors_per_sample)[:neighbors_per_sample]
+            candidates = candidates[top_k]
 
-                    # AABB overlap test as proxy for intersection.
-                    if _aabb_overlap(
-                        bbox_min[i], bbox_max[i],
-                        bbox_min[j], bbox_max[j],
-                    ):
-                        n_intersecting_pairs += 1
-                        intersecting_faces.add(i)
-                        intersecting_faces.add(j)
+        # Vectorized AABB overlap: strict inequality
+        overlap = np.all(bbox_min[si] < bbox_max[candidates], axis=1) & \
+                  np.all(bbox_min[candidates] < bbox_max[si], axis=1)
 
-    # Compute fraction of tested faces that are involved in intersections.
-    n_tested = sample_size if was_subsampled else n_faces
+        n_overlapping = int(overlap.sum())
+        if n_overlapping > 0:
+            n_intersecting_pairs += n_overlapping
+            intersecting_faces.add(si)
+            for ci in candidates[overlap]:
+                intersecting_faces.add(int(ci))
+
+    n_tested = len(sample_indices)
     intersection_fraction = len(intersecting_faces) / max(n_tested, 1)
 
-    # If subsampled, scale the pair count estimate to full mesh.
     if was_subsampled:
-        scale_factor = n_faces / sample_size
-        n_intersecting_pairs = int(n_intersecting_pairs * scale_factor)
+        scale = n_faces / n_tested
+        n_intersecting_pairs = int(n_intersecting_pairs * scale)
 
     return n_intersecting_pairs, intersection_fraction, was_subsampled
 
@@ -150,14 +124,12 @@ def _check_intersections(
 class SelfIntersectionMetric(MetricComputer):
     """Detects self-intersecting triangles in a mesh.
 
-    Uses spatial hash partitioning (8x8x8 grid) with per-triangle AABB overlap
-    as a proxy for intersection. For large meshes (>200K faces), a random
-    subsample of 50K faces is tested and results are scaled.
+    Uses spatial partitioning with vectorized AABB overlap testing.
+    For large meshes, samples faces and tests nearby non-adjacent faces.
 
     Score mapping:
         0% intersecting faces -> 1.0
         5%+ intersecting faces -> 0.0
-        Linear interpolation in between.
     """
 
     name: str = "self_intersections"
@@ -169,9 +141,7 @@ class SelfIntersectionMetric(MetricComputer):
 
         if len(triangles) == 0:
             return MetricResult(
-                name=self.name,
-                score=1.0,
-                weight=self.weight,
+                name=self.name, score=1.0, weight=self.weight,
                 details={
                     "n_intersecting_pairs": 0,
                     "intersection_fraction": 0.0,
@@ -181,10 +151,9 @@ class SelfIntersectionMetric(MetricComputer):
             )
 
         n_intersecting_pairs, intersection_fraction, was_subsampled = (
-            _check_intersections(vertices, triangles, mesh, sample_size=50_000)
+            _check_intersections_vectorized(vertices, triangles, mesh)
         )
 
-        # Score: 1.0 at 0% intersections, 0.0 at 5%+ intersections.
         clamped = float(np.clip(intersection_fraction, 0.0, 0.05))
         score = 1.0 - clamped * 20.0
 
