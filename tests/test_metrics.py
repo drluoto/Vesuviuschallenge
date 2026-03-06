@@ -66,6 +66,13 @@ class TestSheetSwitching:
         assert result.details["n_switch_regions"] >= 1
         assert result.details["total_switch_area_fraction"] > 0
 
+    def test_parallel_layer_switch_detected(self, parallel_layer_switch_mesh):
+        """Edge-length detector catches switches between parallel layers."""
+        from vesuvius_mesh_qa.metrics.normals import SheetSwitchingMetric
+        result = SheetSwitchingMetric().compute(parallel_layer_switch_mesh)
+        assert result.score < 1.0
+        assert result.details["n_edge_flagged"] > 0
+
 
 class TestNoise:
     def test_perfect_plane_no_noise(self, perfect_plane):
@@ -109,3 +116,24 @@ class TestSelfIntersections:
         our_result = SelfIntersectionMetric().compute(self_intersecting_mesh)
         assert o3d_result is True
         assert our_result.details["n_intersecting_pairs"] > 0
+
+
+class TestVisualization:
+    def test_export_ply(self, perfect_plane, tmp_path):
+        """Visualization exports a valid PLY file with vertex colors."""
+        import open3d as o3d
+        from vesuvius_mesh_qa.metrics.summary import compute_all_metrics
+        from vesuvius_mesh_qa.report.visualize import export_visualization
+
+        results = compute_all_metrics(perfect_plane)
+        out_path = tmp_path / "viz.ply"
+        export_visualization(perfect_plane, results, out_path)
+
+        assert out_path.exists()
+        assert out_path.stat().st_size > 0
+
+        # Reload and check it has vertex colors
+        loaded = o3d.io.read_triangle_mesh(str(out_path))
+        assert loaded.has_vertex_colors()
+        assert len(loaded.vertices) == len(perfect_plane.vertices)
+        assert len(loaded.triangles) == len(perfect_plane.triangles)

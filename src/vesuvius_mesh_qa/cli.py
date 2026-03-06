@@ -17,6 +17,7 @@ from vesuvius_mesh_qa.io.loader import load_mesh
 from vesuvius_mesh_qa.metrics.summary import compute_all_metrics, aggregate_score, letter_grade
 from vesuvius_mesh_qa.report.json_report import build_json_report
 from vesuvius_mesh_qa.report.csv_report import build_csv_row
+from vesuvius_mesh_qa.report.visualize import export_visualization
 
 console = Console()
 
@@ -31,7 +32,8 @@ def cli():
 @click.argument("path", type=click.Path(exists=True))
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--weights", type=str, default=None, help="JSON string of metric weight overrides")
-def score(path: str, fmt: str, weights: str | None):
+@click.option("--visualize", type=click.Path(), default=None, help="Export colored PLY highlighting problem regions")
+def score(path: str, fmt: str, weights: str | None, visualize: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
 
@@ -74,6 +76,11 @@ def score(path: str, fmt: str, weights: str | None):
         progress.update(task, completed=6)
     agg = aggregate_score(results)
     grade = letter_grade(agg)
+
+    if visualize:
+        viz_path = Path(visualize)
+        export_visualization(mesh, results, viz_path)
+        console.print(f"  Visualization saved to [bold]{viz_path}[/bold]")
 
     if fmt == "json":
         report = build_json_report(mesh_path, mesh, results, agg, grade)

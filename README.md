@@ -61,18 +61,19 @@ Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score
 
 The most valuable metric. Detects regions where a segmentation mesh incorrectly jumps between adjacent papyrus layers — the primary failure mode in automated scroll segmentation.
 
-**Algorithm:**
-1. Build sparse face adjacency matrix
-2. Compute 8-ring neighborhood via repeated squaring (adj^2 -> adj^4 -> adj^8)
-3. Smooth normals by averaging over the 8-ring neighborhood
-4. Flag faces where the actual normal deviates >35 degrees from the smoothed normal
-5. Cluster flagged faces into connected components (BFS)
-6. Filter clusters <20 faces (noise)
-7. Score = 1 - (flagged area / total area)
+Uses two complementary detectors:
 
-The wide 8-ring neighborhood is necessary because sheet switches create transition zones that are locally consistent — a smaller neighborhood (e.g. 3-ring) would match the transition's own normals and miss the problem entirely.
+**Detector 1: Normal deviation** — catches switches that create angular bends (e.g. when layers diverge):
+1. Compute 8-ring neighborhood via repeated squaring (adj^2 -> adj^4 -> adj^8)
+2. Smooth normals by averaging over the 8-ring neighborhood
+3. Flag faces where normal deviates >35 degrees from smoothed normal
 
-Reports the number, size, and centroid of each detected switch region.
+**Detector 2: Edge length outliers** — catches switches between tightly packed parallel layers (the common case):
+1. Compute max edge length per face
+2. Compare to 4-ring neighborhood mean using MAD-based z-scores
+3. Flag faces with z-score > 2.0 (abnormally long edges from stretching between layers)
+
+The union of both detectors is clustered into connected components (BFS), filtered for clusters >= 20 faces, and scored by flagged area fraction. Each detected region is tagged with which detector found it (`normal`, `edge_length`, or `both`).
 
 ### Self-Intersection Detection
 
@@ -81,6 +82,23 @@ Uses the Moller (1997) triangle-triangle intersection algorithm instead of AABB 
 ### Noise Detection
 
 Mesh-aware statistical outlier detection. Excludes vertices within 3 hops of mesh boundaries before running Open3D's statistical outlier removal — boundary neighborhoods have fewer point cloud neighbors and would otherwise produce false positives.
+
+## Visualization
+
+Export a colored PLY mesh highlighting problem regions:
+
+```bash
+mesh-qa score segment.obj --visualize problems.ply
+```
+
+Open the PLY in MeshLab, CloudCompare, or any 3D viewer. Color coding:
+- **Green** — no issues
+- **Red** — sheet switching
+- **Magenta** — self-intersections
+- **Orange** — poor triangle quality
+- **Blue** — noise/spikes
+- **Yellow** — normal inconsistency
+- **Purple** — topology issues
 
 ## Batch Mode
 

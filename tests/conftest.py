@@ -164,6 +164,47 @@ def self_intersecting_mesh():
 
 
 @pytest.fixture
+def parallel_layer_switch_mesh():
+    """A mesh that jumps between two parallel layers without angular change.
+
+    Simulates the common sheet switch case: two flat parallel layers at z=0
+    and z=0.5 (tightly packed), connected by stretched triangles in the
+    transition zone. Normals stay roughly the same (both layers are flat),
+    but the edges in the transition are abnormally long.
+    """
+    rows, cols = 60, 60
+    vertices = []
+    for i in range(rows + 1):
+        for j in range(cols + 1):
+            x, y = float(j), float(i)
+            z = 0.0
+            # At row 30, abruptly jump to z=3.0 (parallel layer)
+            # The transition happens over a single row, creating stretched edges
+            if i >= 31:
+                z = 3.0
+            elif i == 30:
+                z = 3.0  # single-row jump
+            vertices.append([x, y, z])
+
+    triangles = []
+    for i in range(rows):
+        for j in range(cols):
+            v0 = i * (cols + 1) + j
+            v1 = v0 + 1
+            v2 = v0 + (cols + 1)
+            v3 = v2 + 1
+            triangles.append([v0, v1, v2])
+            triangles.append([v1, v3, v2])
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(np.array(vertices, dtype=np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles, dtype=np.int32))
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    return mesh
+
+
+@pytest.fixture
 def non_manifold_mesh():
     """A mesh with T-junction non-manifold edges."""
     # Two triangles sharing an edge, plus a third triangle creating a T-junction

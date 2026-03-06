@@ -145,6 +145,89 @@ class NormalConsistencyMetric(MetricComputer):
 # ---------------------------------------------------------------------------
 
 
+def _detect_edge_length_outliers(
+    vertices: np.ndarray, triangles: np.ndarray, adj: sparse.csr_matrix,
+    std_threshold: float = 2.0, min_cluster_faces: int = 10,
+) -> tuple[np.ndarray, int]:
+    """Detect faces with abnormally long edges relative to local neighborhood.
+
+    Sheet switches between tightly packed parallel layers create stretched
+    triangles where the mesh bridges between layers. These faces have edges
+    significantly longer than their neighbors.
+
+    Uses per-face max edge length compared to the 4-ring neighborhood median.
+    Faces where max_edge > median + std_threshold * MAD are flagged.
+
+    Returns:
+        (flagged_face_indices, n_regions)
+    """
+    n_faces = len(triangles)
+    if n_faces == 0:
+        return np.array([], dtype=np.int64), 0
+
+    # Compute max edge length per face
+    v0 = vertices[triangles[:, 0]]
+    v1 = vertices[triangles[:, 1]]
+    v2 = vertices[triangles[:, 2]]
+    e_lens = np.stack([
+        np.linalg.norm(v1 - v0, axis=1),
+        np.linalg.norm(v2 - v1, axis=1),
+        np.linalg.norm(v0 - v2, axis=1),
+    ], axis=1)  # (F, 3)
+    max_edge = e_lens.max(axis=1)  # (F,)
+
+    # 4-ring neighborhood via repeated squaring
+    a2 = adj.dot(adj); a2.data[:] = 1.0
+    adj4 = a2.dot(a2); adj4.data[:] = 1.0
+
+    # Compute local median edge length per face over 4-ring
+    # For efficiency, compute smoothed mean and MAD instead of true median
+    neighbor_counts = np.array(adj4.sum(axis=1)).ravel()
+    neighbor_counts = np.maximum(neighbor_counts, 1.0)
+    local_mean = np.array(adj4.dot(max_edge)).ravel() / neighbor_counts
+
+    # Local MAD approximation: mean of |x - local_mean|
+    abs_dev = np.abs(max_edge - local_mean)
+    local_mad = np.array(adj4.dot(abs_dev)).ravel() / neighbor_counts
+    local_mad = np.maximum(local_mad, 1e-8)
+
+    # Flag faces where max edge is far above local mean
+    z_scores = (max_edge - local_mean) / local_mad
+    flagged_mask = z_scores > std_threshold
+
+    flagged_indices = set(np.nonzero(flagged_mask)[0].tolist())
+    if not flagged_indices:
+        return np.array([], dtype=np.int64), 0
+
+    # Cluster flagged faces via BFS
+    clusters: list[list[int]] = []
+    remaining = set(flagged_indices)
+    while remaining:
+        seed = next(iter(remaining))
+        cluster: list[int] = []
+        queue: deque[int] = deque([seed])
+        remaining.discard(seed)
+        while queue:
+            current = queue.popleft()
+            cluster.append(current)
+            row_start = adj.indptr[current]
+            row_end = adj.indptr[current + 1]
+            for nb in adj.indices[row_start:row_end]:
+                if nb in remaining:
+                    remaining.discard(nb)
+                    queue.append(nb)
+        clusters.append(cluster)
+
+    valid = [c for c in clusters if len(c) >= min_cluster_faces]
+    if not valid:
+        return np.array([], dtype=np.int64), 0
+
+    all_faces = []
+    for c in valid:
+        all_faces.extend(c)
+    return np.array(sorted(all_faces), dtype=np.int64), len(valid)
+
+
 class SheetSwitchingMetric(MetricComputer):
     """Detect regions where the mesh surface jumps between scroll layers.
 
@@ -152,22 +235,23 @@ class SheetSwitchingMetric(MetricComputer):
     segmentation: a fitted surface follows one papyrus layer and then
     abruptly transitions to an adjacent layer.
 
-    Algorithm:
-    1. Compute per-face normals.
-    2. Build sparse face adjacency matrix.
-    3. Raise adjacency to the 8th power via repeated squaring for
-       8-ring neighborhoods (wide enough to capture layer transitions).
-    4. Smooth normals by averaging over 8-ring neighborhoods.
-    5. Flag faces deviating > 35 deg from smoothed normal.
-    6. Cluster flagged faces into connected components.
-    7. Filter clusters < 20 faces.
-    8. Score = 1 - (flagged area / total area).
+    Uses two complementary detectors:
+    1. **Normal deviation** — flags faces where the normal deviates >35 deg
+       from 8-ring smoothed normals. Catches switches that create angular
+       bends (e.g. when layers diverge).
+    2. **Edge length outliers** — flags faces with abnormally long edges
+       relative to their 4-ring neighborhood. Catches switches between
+       tightly packed parallel layers where the mesh stretches to bridge
+       between layers (common case, no angular signature).
+
+    The union of both detectors' flagged faces determines the score.
     """
 
     name: str = "sheet_switching"
     weight: float = 0.30
 
     _deviation_threshold_deg: float = 35.0
+    _edge_std_threshold: float = 2.0
     _min_cluster_faces: int = 20
 
     def compute(self, mesh: o3d.geometry.TriangleMesh) -> MetricResult:
@@ -182,47 +266,55 @@ class SheetSwitchingMetric(MetricComputer):
 
         n_faces = len(triangles)
 
-        # Step 1: per-face normals
+        # Per-face normals
         mesh.compute_triangle_normals()
         normals = np.asarray(mesh.triangle_normals).copy()
 
-        # Step 2: sparse adjacency matrix (with self-loops)
+        # Sparse adjacency matrix (with self-loops)
         adj, _, _ = _build_face_adjacency_sparse(triangles)
 
-        # Step 3: 8-ring neighbourhood via repeated squaring (3 mults vs 7)
+        # --- Detector 1: Normal deviation (8-ring) ---
         a2 = adj.dot(adj); a2.data[:] = 1.0
         a4 = a2.dot(a2); a4.data[:] = 1.0
         adj_k = a4.dot(a4); adj_k.data[:] = 1.0
 
-        # Step 4: smoothed normals
         smoothed = adj_k.dot(normals)
         norms = np.linalg.norm(smoothed, axis=1, keepdims=True)
         norms = np.maximum(norms, 1e-12)
         smoothed /= norms
 
-        # Step 5: deviation angle per face
         dots = np.sum(normals * smoothed, axis=1)
         dots = np.clip(dots, -1.0, 1.0)
         deviation_deg = np.degrees(np.arccos(dots))
 
-        flagged_mask = deviation_deg > self._deviation_threshold_deg
-        flagged_indices = set(np.nonzero(flagged_mask)[0].tolist())
+        normal_flagged = set(np.nonzero(deviation_deg > self._deviation_threshold_deg)[0].tolist())
 
-        if not flagged_indices:
+        # --- Detector 2: Edge length outliers (4-ring) ---
+        edge_faces, n_edge_regions = _detect_edge_length_outliers(
+            vertices, triangles, adj,
+            std_threshold=self._edge_std_threshold,
+            min_cluster_faces=self._min_cluster_faces,
+        )
+        edge_flagged = set(edge_faces.tolist()) if len(edge_faces) > 0 else set()
+
+        # --- Union of both detectors ---
+        all_flagged = normal_flagged | edge_flagged
+
+        if not all_flagged:
             return MetricResult(
                 name=self.name, score=1.0, weight=self.weight,
                 details={
                     "n_switch_regions": 0,
+                    "n_normal_flagged": 0,
+                    "n_edge_flagged": 0,
                     "total_switch_area_fraction": 0.0,
                     "problem_regions": [],
                 },
             )
 
-        # Step 6: cluster flagged faces via BFS using sparse adjacency
-        # Extract adjacency for flagged faces from CSR matrix
-        adj_csr = adj  # already has adjacency info
+        # Cluster all flagged faces via BFS
         clusters: list[list[int]] = []
-        remaining = set(flagged_indices)
+        remaining = set(all_flagged)
         while remaining:
             seed = next(iter(remaining))
             cluster: list[int] = []
@@ -231,20 +323,16 @@ class SheetSwitchingMetric(MetricComputer):
             while queue:
                 current = queue.popleft()
                 cluster.append(current)
-                # Get neighbors from sparse row
-                row_start = adj_csr.indptr[current]
-                row_end = adj_csr.indptr[current + 1]
-                neighbors = adj_csr.indices[row_start:row_end]
-                for neighbor in neighbors:
-                    if neighbor in remaining:
-                        remaining.discard(neighbor)
-                        queue.append(neighbor)
+                row_start = adj.indptr[current]
+                row_end = adj.indptr[current + 1]
+                for nb in adj.indices[row_start:row_end]:
+                    if nb in remaining:
+                        remaining.discard(nb)
+                        queue.append(nb)
             clusters.append(cluster)
 
-        # Step 7: filter small clusters
         valid_clusters = [c for c in clusters if len(c) >= self._min_cluster_faces]
 
-        # Step 8: compute areas and score
         face_areas = _compute_face_areas(vertices, triangles)
         total_area = float(face_areas.sum())
 
@@ -272,9 +360,16 @@ class SheetSwitchingMetric(MetricComputer):
             else:
                 centroid = face_centroids.mean(axis=0)
 
+            # Tag whether this region was found by normal, edge, or both
+            cluster_set = set(cluster)
+            has_normal = bool(cluster_set & normal_flagged)
+            has_edge = bool(cluster_set & edge_flagged)
+            detector = "both" if (has_normal and has_edge) else ("normal" if has_normal else "edge_length")
+
             problem_regions.append({
                 "face_count": len(cluster),
                 "centroid": centroid.tolist(),
+                "detector": detector,
             })
 
         flagged_area = float(face_areas[np.array(all_problem_faces)].sum()) if all_problem_faces else 0.0
@@ -292,6 +387,8 @@ class SheetSwitchingMetric(MetricComputer):
             weight=self.weight,
             details={
                 "n_switch_regions": len(valid_clusters),
+                "n_normal_flagged": len(normal_flagged),
+                "n_edge_flagged": len(edge_flagged),
                 "total_switch_area_fraction": switch_area_fraction,
                 "problem_regions": problem_regions,
             },
