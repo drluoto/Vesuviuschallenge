@@ -87,3 +87,25 @@ class TestSelfIntersections:
         result = SelfIntersectionMetric().compute(perfect_plane)
         assert result.score > 0.9
         assert result.name == "self_intersections"
+
+    def test_intersecting_mesh_detected(self, self_intersecting_mesh):
+        from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
+        result = SelfIntersectionMetric().compute(self_intersecting_mesh)
+        assert result.score < 1.0
+        assert result.details["n_intersecting_pairs"] > 0
+
+    def test_cross_validate_no_intersection_with_open3d(self, perfect_plane):
+        """Cross-validate: Open3D and our metric agree on no intersections."""
+        from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
+        o3d_result = perfect_plane.is_self_intersecting()
+        our_result = SelfIntersectionMetric().compute(perfect_plane)
+        assert o3d_result is False
+        assert our_result.details["n_intersecting_pairs"] == 0
+
+    def test_cross_validate_intersection_with_open3d(self, self_intersecting_mesh):
+        """Cross-validate: Open3D and our metric both detect intersections."""
+        from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
+        o3d_result = self_intersecting_mesh.is_self_intersecting()
+        our_result = SelfIntersectionMetric().compute(self_intersecting_mesh)
+        assert o3d_result is True
+        assert our_result.details["n_intersecting_pairs"] > 0

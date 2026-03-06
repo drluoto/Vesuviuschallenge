@@ -112,6 +112,58 @@ def spiked_mesh():
 
 
 @pytest.fixture
+def self_intersecting_mesh():
+    """Two triangulated planes that cross through each other.
+
+    Creates a known self-intersection: a horizontal plane at z=0 and a
+    tilted plane that passes through it, guaranteeing intersections
+    between nearby non-adjacent faces.
+    """
+    vertices = []
+    triangles = []
+
+    # Plane 1: z=0, 20x20 grid
+    rows, cols = 20, 20
+    for i in range(rows + 1):
+        for j in range(cols + 1):
+            vertices.append([float(j), float(i), 0.0])
+
+    n1 = (rows + 1) * (cols + 1)
+    for i in range(rows):
+        for j in range(cols):
+            v0 = i * (cols + 1) + j
+            v1 = v0 + 1
+            v2 = v0 + (cols + 1)
+            v3 = v2 + 1
+            triangles.append([v0, v1, v2])
+            triangles.append([v1, v3, v2])
+
+    # Plane 2: tilted, passes through plane 1 at y=10
+    # z = (y - 10) * 0.5, so z<0 for y<10 and z>0 for y>10
+    for i in range(rows + 1):
+        for j in range(cols + 1):
+            x, y = float(j), float(i)
+            z = (y - 10.0) * 0.5
+            vertices.append([x, y, z])
+
+    for i in range(rows):
+        for j in range(cols):
+            v0 = n1 + i * (cols + 1) + j
+            v1 = v0 + 1
+            v2 = v0 + (cols + 1)
+            v3 = v2 + 1
+            triangles.append([v0, v1, v2])
+            triangles.append([v1, v3, v2])
+
+    mesh = o3d.geometry.TriangleMesh()
+    mesh.vertices = o3d.utility.Vector3dVector(np.array(vertices, dtype=np.float64))
+    mesh.triangles = o3d.utility.Vector3iVector(np.array(triangles, dtype=np.int32))
+    mesh.compute_vertex_normals()
+    mesh.compute_triangle_normals()
+    return mesh
+
+
+@pytest.fixture
 def non_manifold_mesh():
     """A mesh with T-junction non-manifold edges."""
     # Two triangles sharing an edge, plus a third triangle creating a T-junction

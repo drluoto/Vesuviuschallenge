@@ -253,7 +253,8 @@ def _compute_interval(p0, p1, p2, d0, d1, d2):
         denom = di - dj
         # Avoid division by zero
         valid = np.abs(denom) > 1e-12
-        t = np.where(valid, pi + (pj - pi) * di / denom, pi)
+        safe_denom = np.where(valid, denom, 1.0)
+        t = np.where(valid, pi + (pj - pi) * di / safe_denom, pi)
         # This edge contributes a crossing point when signs differ
         crosses = (di * dj) <= 0  # includes zero
         t_min = np.where(crosses & (t < t_min), t, t_min)
