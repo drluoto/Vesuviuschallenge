@@ -53,8 +53,25 @@ def score(path: str, fmt: str, weights: str | None):
     n_faces = len(mesh.triangles)
     console.print(f"  Vertices: {n_vertices:,}  Faces: {n_faces:,}")
 
-    console.print("Computing metrics...")
-    results = compute_all_metrics(mesh, weight_overrides=weight_overrides)
+    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("{task.completed}/{task.total}"),
+        console=console,
+        transient=True,
+    ) as progress:
+        task = progress.add_task("Computing metrics...", total=6)
+
+        def _on_progress(name: str, idx: int, total: int):
+            progress.update(task, completed=idx, description=f"  {name}")
+
+        results = compute_all_metrics(
+            mesh, weight_overrides=weight_overrides, on_progress=_on_progress,
+        )
+        progress.update(task, completed=6)
     agg = aggregate_score(results)
     grade = letter_grade(agg)
 

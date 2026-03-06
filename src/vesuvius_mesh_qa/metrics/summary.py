@@ -27,21 +27,27 @@ DEFAULT_METRICS: list[type[MetricComputer]] = [
 def compute_all_metrics(
     mesh: o3d.geometry.TriangleMesh,
     weight_overrides: dict[str, float] | None = None,
+    on_progress: callable | None = None,
 ) -> list[MetricResult]:
     """Compute all metrics on a mesh.
 
     Args:
         mesh: Open3D triangle mesh with normals computed.
         weight_overrides: Optional dict of {metric_name: new_weight}.
+        on_progress: Optional callback(metric_name, index, total) called
+            before each metric computation.
 
     Returns:
         List of MetricResult from each metric.
     """
+    n_metrics = len(DEFAULT_METRICS)
     results = []
-    for metric_cls in DEFAULT_METRICS:
+    for i, metric_cls in enumerate(DEFAULT_METRICS):
         metric = metric_cls()
         if weight_overrides and metric.name in weight_overrides:
             metric.weight = weight_overrides[metric.name]
+        if on_progress:
+            on_progress(metric.name, i, n_metrics)
         result = metric.compute(mesh)
         results.append(result)
         gc.collect()
