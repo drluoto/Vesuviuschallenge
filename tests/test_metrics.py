@@ -66,12 +66,6 @@ class TestSheetSwitching:
         assert result.details["n_switch_regions"] >= 1
         assert result.details["total_switch_area_fraction"] > 0
 
-    def test_parallel_layer_switch_detected(self, parallel_layer_switch_mesh):
-        """Edge-length detector catches switches between parallel layers."""
-        from vesuvius_mesh_qa.metrics.normals import SheetSwitchingMetric
-        result = SheetSwitchingMetric().compute(parallel_layer_switch_mesh)
-        assert result.score < 1.0
-        assert result.details["n_edge_flagged"] > 0
 
 
 class TestNoise:

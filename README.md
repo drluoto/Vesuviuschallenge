@@ -61,19 +61,18 @@ Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score
 
 The most valuable metric. Detects regions where a segmentation mesh incorrectly jumps between adjacent papyrus layers — the primary failure mode in automated scroll segmentation.
 
-Uses two complementary detectors:
+**Algorithm:**
+1. Build sparse face adjacency matrix
+2. Compute 8-ring neighborhood via repeated squaring (adj^2 -> adj^4 -> adj^8)
+3. Smooth normals by averaging over the 8-ring neighborhood
+4. Flag faces where the actual normal deviates >35 degrees from the smoothed normal
+5. Cluster flagged faces into connected components (BFS)
+6. Filter clusters <20 faces (noise)
+7. Score = 1 - (flagged area / total area)
 
-**Detector 1: Normal deviation** — catches switches that create angular bends (e.g. when layers diverge):
-1. Compute 8-ring neighborhood via repeated squaring (adj^2 -> adj^4 -> adj^8)
-2. Smooth normals by averaging over the 8-ring neighborhood
-3. Flag faces where normal deviates >35 degrees from smoothed normal
+The wide 8-ring neighborhood is necessary because sheet switches create transition zones that are locally consistent — a smaller neighborhood (e.g. 3-ring) would match the transition's own normals and miss the problem entirely.
 
-**Detector 2: Edge length outliers** — catches switches between tightly packed parallel layers (the common case):
-1. Compute max edge length per face
-2. Compare to 4-ring neighborhood mean using MAD-based z-scores
-3. Flag faces with z-score > 2.0 (abnormally long edges from stretching between layers)
-
-The union of both detectors is clustered into connected components (BFS), filtered for clusters >= 20 faces, and scored by flagged area fraction. Each detected region is tagged with which detector found it (`normal`, `edge_length`, or `both`).
+**Limitation:** This detects angular surface anomalies, which catches sheet switches where layers diverge at an angle. It cannot detect switches between tightly packed parallel layers where normals stay similar — that requires CT volume context. Reports the number, size, and centroid of each detected region.
 
 ### Self-Intersection Detection
 
