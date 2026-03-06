@@ -2,7 +2,7 @@
 
 Automated mesh quality scoring for [Vesuvius Challenge](https://scrollprize.org) segmentation meshes.
 
-Scores segment meshes on 6 quality metrics — including **sheet switching detection** — so the community can prioritize which segments are worth reviewing. No GPU required.
+Scores segment meshes on 6 geometry metrics — plus an optional **CT-informed sheet switching detector** that compares mesh normals against actual papyrus layer orientation from the CT volume. No GPU required.
 
 ## Why
 
@@ -21,6 +21,10 @@ mesh-qa score path/to/segment.obj
 
 # Score with JSON output
 mesh-qa score path/to/segment.obj --format json
+
+# Score with CT-informed sheet switching (requires volume URL)
+mesh-qa score path/to/segment.obj \
+  --volume 'https://data.aws.ash2txt.org/samples/PHerc1667/volumes/20231117161658-7.910um-53keV-masked.zarr/'
 
 # Batch score all segments in a volpkg
 mesh-qa batch path/to/volpkg/paths/ -o rankings.csv
@@ -54,6 +58,7 @@ mesh-qa batch path/to/volpkg/paths/ -o rankings.csv
 | `sheet_switching` | 0.30 | **Detects layer-jumping failures** (the key metric) |
 | `self_intersections` | 0.15 | Self-overlapping geometry (Moller triangle intersection) |
 | `noise` | 0.10 | Statistical outlier vertices (spikes) |
+| `ct_sheet_switching` | 0.20 | **CT-informed layer alignment** (optional, requires `--volume`) |
 
 Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score is the weighted average. Letter grades: A (>0.9), B (>0.75), C (>0.6), D (>0.4), F.
 
@@ -72,7 +77,24 @@ The most valuable metric. Detects regions where a segmentation mesh incorrectly 
 
 The wide 8-ring neighborhood is necessary because sheet switches create transition zones that are locally consistent — a smaller neighborhood (e.g. 3-ring) would match the transition's own normals and miss the problem entirely.
 
-**Limitation:** This detects angular surface anomalies, which catches sheet switches where layers diverge at an angle. It cannot detect switches between tightly packed parallel layers where normals stay similar — that requires CT volume context. Reports the number, size, and centroid of each detected region.
+**Limitation:** This detects angular surface anomalies, which catches sheet switches where layers diverge at an angle. It cannot detect switches between tightly packed parallel layers where normals stay similar — for that, use the CT-informed metric below.
+
+### CT-Informed Sheet Switching (Optional)
+
+When a zarr volume URL is provided via `--volume`, an additional metric compares mesh normals against CT-derived papyrus layer normals using 3D structure tensor analysis. This catches the hard case: parallel-layer switches invisible to geometry-only analysis.
+
+**Algorithm:**
+1. Sample 500 mesh vertices
+2. Fetch 32x32x32 CT neighborhood at each vertex (lazy remote zarr access)
+3. Compute 3D structure tensor using Holoborodko derivative kernels (sigma=3.0)
+4. Extract largest eigenvector = papyrus sheet normal from CT data
+5. Measure angular deviation between mesh normal and CT-derived normal
+6. Only count vertices with clear sheet structure (anisotropy > 0.1)
+7. Score = fraction of structured vertices aligned within 45 degrees
+
+**What this catches that geometry-only cannot:** When a mesh jumps to an adjacent papyrus layer but the layers are nearly parallel, the mesh normals look fine — the geometry-only detector sees nothing wrong. But the CT structure tensor reveals the actual papyrus orientation at each point. If the mesh normal disagrees with the CT-derived normal, the mesh is on the wrong layer.
+
+**Requirements:** Network access to the scroll's OME-Zarr volume (chunks fetched lazily, typically 50-500 MB). Adds ~2-5 minutes to scoring time. Available sample volumes at `https://data.aws.ash2txt.org/samples/`.
 
 ### Self-Intersection Detection
 
@@ -135,15 +157,18 @@ Tested on real scroll segments from the Vesuvius Challenge dataset:
 |--------|---------|-------|-------|-------|
 | PHerc0332 | 20240711124827 | 340K | 0.993 | A |
 | PHerc0332 | 20231210121321 | 1.1M | 0.990 | A |
+| PHerc1667 | 20231210132040 | 544K | 0.950 | A | (with CT metric)
 
-Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method.
+Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method. CT-informed metric validated by comparing structure tensor normals against mesh normals at 500 sampled vertices (median alignment 22°, consistent with correctly-segmented papyrus).
 
 ## Requirements
 
 - Python 3.10+
 - open3d, trimesh, numpy, scipy, click, rich, pandas
+- Optional: zarr, fsspec, vesuvius (for CT-informed metric)
 - No GPU required — pure geometry and statistics
-- Runs in <30s on 1M+ face meshes (Apple M2)
+- Geometry metrics: <30s on 1M+ face meshes (Apple M2)
+- CT metric: +2-5 min (network I/O for remote zarr chunks)
 
 ## License
 
