@@ -155,9 +155,10 @@ class SheetSwitchingMetric(MetricComputer):
     Algorithm:
     1. Compute per-face normals.
     2. Build sparse face adjacency matrix.
-    3. Raise adjacency to the 3rd power for 3-ring neighborhoods.
-    4. Smooth normals by averaging over 3-ring neighborhoods.
-    5. Flag faces deviating > 45 deg from smoothed normal.
+    3. Raise adjacency to the 8th power via repeated squaring for
+       8-ring neighborhoods (wide enough to capture layer transitions).
+    4. Smooth normals by averaging over 8-ring neighborhoods.
+    5. Flag faces deviating > 35 deg from smoothed normal.
     6. Cluster flagged faces into connected components.
     7. Filter clusters < 20 faces.
     8. Score = 1 - (flagged area / total area).
@@ -166,7 +167,7 @@ class SheetSwitchingMetric(MetricComputer):
     name: str = "sheet_switching"
     weight: float = 0.30
 
-    _deviation_threshold_deg: float = 45.0
+    _deviation_threshold_deg: float = 35.0
     _min_cluster_faces: int = 20
 
     def compute(self, mesh: o3d.geometry.TriangleMesh) -> MetricResult:
@@ -188,11 +189,10 @@ class SheetSwitchingMetric(MetricComputer):
         # Step 2: sparse adjacency matrix (with self-loops)
         adj, _, _ = _build_face_adjacency_sparse(triangles)
 
-        # Step 3: 3-ring neighbourhood via matrix power
-        adj_k = adj.copy()
-        for _ in range(2):
-            adj_k = adj_k.dot(adj)
-            adj_k.data[:] = 1.0  # binarise
+        # Step 3: 8-ring neighbourhood via repeated squaring (3 mults vs 7)
+        a2 = adj.dot(adj); a2.data[:] = 1.0
+        a4 = a2.dot(a2); a4.data[:] = 1.0
+        adj_k = a4.dot(a4); adj_k.data[:] = 1.0
 
         # Step 4: smoothed normals
         smoothed = adj_k.dot(normals)

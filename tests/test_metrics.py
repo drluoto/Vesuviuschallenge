@@ -62,8 +62,9 @@ class TestSheetSwitching:
         result = SheetSwitchingMetric().compute(sheet_switch_mesh)
         # Should detect switching and score lower
         assert result.score < 1.0
-        # The connecting strip should create detectable anomalies
-        assert result.details["n_switch_regions"] >= 0  # At least detected something
+        # The layer transition zone should be detected as a switch region
+        assert result.details["n_switch_regions"] >= 1
+        assert result.details["total_switch_area_fraction"] > 0
 
 
 class TestNoise:

@@ -51,21 +51,34 @@ def perfect_plane():
 
 @pytest.fixture
 def sheet_switch_mesh():
-    """Two parallel planes connected by a strip that jumps between them.
+    """A curved scroll-like surface that jumps between two layers.
 
-    Simulates the sheet switching failure mode.
+    Simulates real sheet switching: a surface follows a gentle curve (like
+    a section of papyrus scroll), then abruptly transitions to a parallel
+    layer offset in the normal direction, then continues on that layer.
     """
+    rows, cols = 80, 80
     vertices = []
-    triangles = []
-
-    # Bottom plane: z=0, 50x50 grid
-    rows, cols = 50, 50
+    # Generate a gently curved surface (like a section of scroll)
+    # with a sheet switch: at y=40, the surface jumps from one layer to
+    # an adjacent layer (offset by 5 units in z)
     for i in range(rows + 1):
         for j in range(cols + 1):
-            vertices.append([float(j), float(i), 0.0])
+            x = float(j)
+            y = float(i)
+            # Gentle curvature to simulate scroll surface
+            z = 2.0 * np.sin(x * np.pi / cols)
+            # Sheet switch: at y=40, surface abruptly jumps to adjacent layer
+            # Over just 2 rows (steep ramp), z shifts by 5 units
+            if i > 41:
+                z += 5.0
+            elif i == 41:
+                z += 3.5
+            elif i == 40:
+                z += 1.5
+            vertices.append([x, y, z])
 
-    n_verts_per_plane = (rows + 1) * (cols + 1)
-
+    triangles = []
     for i in range(rows):
         for j in range(cols):
             v0 = i * (cols + 1) + j
@@ -74,34 +87,6 @@ def sheet_switch_mesh():
             v3 = v2 + 1
             triangles.append([v0, v1, v2])
             triangles.append([v1, v3, v2])
-
-    # Top plane: z=5, same grid but shifted up
-    offset = n_verts_per_plane
-    for i in range(rows + 1):
-        for j in range(cols + 1):
-            vertices.append([float(j), float(i), 5.0])
-
-    for i in range(rows):
-        for j in range(cols):
-            v0 = offset + i * (cols + 1) + j
-            v1 = v0 + 1
-            v2 = v0 + (cols + 1)
-            v3 = v2 + 1
-            triangles.append([v0, v1, v2])
-            triangles.append([v1, v3, v2])
-
-    # Connecting strip: 50 quads jumping from z=0 to z=5 along y=25
-    # This creates a vertical wall that represents a sheet switch
-    strip_row = 25
-    for j in range(cols):
-        # Bottom edge vertices (z=0 plane)
-        b0 = strip_row * (cols + 1) + j
-        b1 = b0 + 1
-        # Top edge vertices (z=5 plane)
-        t0 = offset + strip_row * (cols + 1) + j
-        t1 = t0 + 1
-        triangles.append([b0, b1, t0])
-        triangles.append([b1, t1, t0])
 
     mesh = o3d.geometry.TriangleMesh()
     mesh.vertices = o3d.utility.Vector3dVector(np.array(vertices, dtype=np.float64))
