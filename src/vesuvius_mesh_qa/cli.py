@@ -146,7 +146,41 @@ def batch(directory: str, output: str | None, weights: str | None):
     if output:
         df.to_csv(output, index=False)
         console.print(f"\nResults saved to [bold]{output}[/bold]")
-    else:
-        console.print(df.to_string(index=False))
 
+    # Always print a summary table
+    table = Table(title="Batch Results (worst → best)")
+    table.add_column("Segment", style="cyan")
+    table.add_column("Faces", justify="right")
+    table.add_column("Score", justify="right")
+    table.add_column("Grade", justify="center")
+    table.add_column("Worst Metric", style="dim")
+
+    metric_cols = ["triangle_quality", "topology", "normal_consistency",
+                   "sheet_switching", "self_intersections", "noise"]
+    for _, row in df.iterrows():
+        if "error" in row and pd.notna(row.get("error")):
+            table.add_row(row["segment_id"], "—", "[red]ERR[/red]", "F", str(row.get("error", ""))[:40])
+            continue
+        n_faces = f"{int(row.get('n_faces', 0)):,}" if pd.notna(row.get("n_faces")) else "—"
+        agg = row["aggregate_score"]
+        grade = row["grade"]
+        grade_color = {"A": "green", "B": "cyan", "C": "yellow", "D": "red", "F": "red"}.get(grade, "white")
+        score_color = "green" if agg >= 0.95 else "yellow" if agg >= 0.85 else "red"
+        # Find worst metric
+        worst_name, worst_val = "", 1.0
+        for mc in metric_cols:
+            val = row.get(mc)
+            if val is not None and pd.notna(val) and val < worst_val:
+                worst_val = val
+                worst_name = mc
+        worst_str = f"{worst_name}={worst_val:.3f}" if worst_name else ""
+        table.add_row(
+            row["segment_id"],
+            n_faces,
+            f"[{score_color}]{agg:.3f}[/{score_color}]",
+            f"[{grade_color}]{grade}[/{grade_color}]",
+            worst_str,
+        )
+
+    console.print(table)
     console.print(f"\n[bold]{len(rows)}[/bold] segments scored.")
