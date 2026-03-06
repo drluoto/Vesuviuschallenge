@@ -9,6 +9,12 @@ description = "Automated mesh quality scoring for Vesuvius Challenge segmentatio
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "MIT"}
+authors = [{name = "Johannes Luoto"}]
+
+[project.urls]
+Homepage = "https://github.com/drluoto/Vesuviuschallenge"
+Repository = "https://github.com/drluoto/Vesuviuschallenge"
+
 dependencies = [
     "open3d>=0.17",
     "trimesh>=4.0",
