@@ -24,6 +24,10 @@ dependencies = [
     "rich>=13.0",
     "pandas>=2.0",
     "tqdm>=4.60",
+    "zarr>=2.16",
+    "fsspec>=2023.6",
+    "aiohttp>=3.8",
+    "vesuvius>=0.2",
 ]
 
 [project.optional-dependencies]

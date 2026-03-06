@@ -33,7 +33,9 @@ def cli():
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--weights", type=str, default=None, help="JSON string of metric weight overrides")
 @click.option("--visualize", type=click.Path(), default=None, help="Export colored PLY highlighting problem regions")
-def score(path: str, fmt: str, weights: str | None, visualize: str | None):
+@click.option("--volume", type=str, default=None,
+              help="OME-Zarr volume URL for CT-informed sheet switching detection")
+def score(path: str, fmt: str, weights: str | None, visualize: str | None, volume: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
 
@@ -65,15 +67,17 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None):
         console=console,
         transient=True,
     ) as progress:
-        task = progress.add_task("Computing metrics...", total=6)
+        n_metrics = 7 if volume else 6
+        task = progress.add_task("Computing metrics...", total=n_metrics)
 
         def _on_progress(name: str, idx: int, total: int):
             progress.update(task, completed=idx, description=f"  {name}")
 
         results = compute_all_metrics(
             mesh, weight_overrides=weight_overrides, on_progress=_on_progress,
+            volume_url=volume,
         )
-        progress.update(task, completed=6)
+        progress.update(task, completed=n_metrics)
     agg = aggregate_score(results)
     grade = letter_grade(agg)
 

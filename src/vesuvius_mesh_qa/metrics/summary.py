@@ -12,6 +12,8 @@ from vesuvius_mesh_qa.metrics.topology import TopologyMetric
 from vesuvius_mesh_qa.metrics.normals import NormalConsistencyMetric, SheetSwitchingMetric
 from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
 from vesuvius_mesh_qa.metrics.noise import NoiseMetric
+from vesuvius_mesh_qa.metrics.ct_switching import CTSheetSwitchingMetric
+from vesuvius_mesh_qa.volume import VolumeAccessor
 
 
 DEFAULT_METRICS: list[type[MetricComputer]] = [
@@ -28,6 +30,7 @@ def compute_all_metrics(
     mesh: o3d.geometry.TriangleMesh,
     weight_overrides: dict[str, float] | None = None,
     on_progress: callable | None = None,
+    volume_url: str | None = None,
 ) -> list[MetricResult]:
     """Compute all metrics on a mesh.
 
@@ -36,14 +39,24 @@ def compute_all_metrics(
         weight_overrides: Optional dict of {metric_name: new_weight}.
         on_progress: Optional callback(metric_name, index, total) called
             before each metric computation.
+        volume_url: Optional OME-Zarr volume URL for CT-informed sheet
+            switching detection. When provided, a CTSheetSwitchingMetric
+            is appended to the default metrics.
 
     Returns:
         List of MetricResult from each metric.
     """
-    n_metrics = len(DEFAULT_METRICS)
+    # Build metrics list: default metrics + optional CT metric
+    metrics: list[MetricComputer] = [cls() for cls in DEFAULT_METRICS]
+
+    if volume_url is not None:
+        accessor = VolumeAccessor(volume_url)
+        ct_metric = CTSheetSwitchingMetric(accessor)
+        metrics.append(ct_metric)
+
+    n_metrics = len(metrics)
     results = []
-    for i, metric_cls in enumerate(DEFAULT_METRICS):
-        metric = metric_cls()
+    for i, metric in enumerate(metrics):
         if weight_overrides and metric.name in weight_overrides:
             metric.weight = weight_overrides[metric.name]
         if on_progress:
