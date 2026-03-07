@@ -56,9 +56,9 @@ mesh-qa batch path/to/volpkg/paths/ -o rankings.csv
 | `topology` | 0.10 | Manifoldness, connected components, boundary edges |
 | `normal_consistency` | 0.15 | Smoothness of adjacent face normals |
 | `sheet_switching` | 0.30 | **Detects layer-jumping failures** (the key metric) |
-| `self_intersections` | 0.15 | Self-overlapping geometry (Moller triangle intersection) |
+| `self_intersections` | 0.20 | Self-overlapping geometry (Moller triangle intersection) |
 | `noise` | 0.10 | Statistical outlier vertices (spikes) |
-| `ct_sheet_switching` | 0.20 | **CT-informed layer alignment** (optional, requires `--volume`) |
+| `ct_sheet_switching` | 0.10 | **CT-informed layer alignment** (experimental, requires `--volume`) |
 
 Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score is the weighted average. Letter grades: A (>0.9), B (>0.75), C (>0.6), D (>0.4), F.
 
@@ -79,9 +79,9 @@ The wide 8-ring neighborhood is necessary because sheet switches create transiti
 
 **Limitation:** This detects angular surface anomalies, which catches sheet switches where layers diverge at an angle. It cannot detect switches between tightly packed parallel layers where normals stay similar — for that, use the CT-informed metric below.
 
-### CT-Informed Sheet Switching (Optional)
+### CT-Informed Sheet Switching (Experimental)
 
-When a zarr volume URL is provided via `--volume`, an additional metric compares mesh normals against CT-derived papyrus layer normals using 3D structure tensor analysis. This catches the hard case: parallel-layer switches invisible to geometry-only analysis.
+When a zarr volume URL is provided via `--volume`, an additional metric compares mesh normals against CT-derived papyrus layer normals using 3D structure tensor analysis.
 
 **Algorithm:**
 1. Sample 500 mesh vertices
@@ -89,12 +89,11 @@ When a zarr volume URL is provided via `--volume`, an additional metric compares
 3. Compute 3D structure tensor using Holoborodko derivative kernels (sigma=3.0)
 4. Extract largest eigenvector = papyrus sheet normal from CT data
 5. Measure angular deviation between mesh normal and CT-derived normal
-6. Only count vertices with clear sheet structure (anisotropy > 0.1)
-7. Score = fraction of structured vertices aligned within 45 degrees
+6. Score = mean cosine similarity across all sampled vertices
 
-**What this catches that geometry-only cannot:** When a mesh jumps to an adjacent papyrus layer but the layers are nearly parallel, the mesh normals look fine — the geometry-only detector sees nothing wrong. But the CT structure tensor reveals the actual papyrus orientation at each point. If the mesh normal disagrees with the CT-derived normal, the mesh is on the wrong layer.
+**Current status:** The metric produces a continuous alignment score but has a high baseline noise level (~25-30° median angle even on correctly-segmented papyrus). This is inherent to the structure tensor approach at 7-8µm resolution where papyrus layers are ~100-200µm apart. The metric is weighted at 0.10 (lowest) to reflect this. Validation on bruniss's PHerc1667 data showed the aggregate scorer (all metrics combined) cleanly separates manual segments (0.906-0.921) from error-containing autogens (0.765-0.804), but this separation is primarily driven by the geometry metrics (self-intersections, topology), not the CT metric.
 
-**Requirements:** Network access to the scroll's OME-Zarr volume (chunks fetched lazily, typically 50-500 MB). Adds ~2-5 minutes to scoring time. Available sample volumes at `https://data.aws.ash2txt.org/samples/`.
+**Requirements:** Network access to the scroll's OME-Zarr volume (chunks fetched lazily, typically 50-500 MB). Adds ~2-5 minutes to scoring time. Requires `zarr>=2.16` with zarr v2 format support.
 
 ### Self-Intersection Detection
 
@@ -151,15 +150,18 @@ mesh-qa score segment.obj --weights '{"sheet_switching": 0.5, "noise": 0.05}'
 
 ## Validated On
 
-Tested on real scroll segments from the Vesuvius Challenge dataset:
+Validated on bruniss's PHerc1667 (Scroll 4) segments — 3 manual segmentations and 3 autogens with known errors:
 
-| Scroll | Segment | Faces | Score | Grade |
-|--------|---------|-------|-------|-------|
-| PHerc0332 | 20240711124827 | 340K | 0.993 | A |
-| PHerc0332 | 20231210121321 | 1.1M | 0.990 | A |
-| PHerc1667 | 20231210132040 | 544K | 0.950 | A | (with CT metric)
+| Type | Segment | Faces | Score | Grade |
+|------|---------|-------|-------|-------|
+| Manual | 20240413132301 | 134K | 0.921 | A |
+| Manual | 20240415173945 | 76K | 0.908 | A |
+| Manual | 1667segment-1 | 19K | 0.906 | A |
+| Autogen | 02231955 | 595K | 0.803 | B |
+| Autogen | unroll_attempt_1 | 653K | 0.804 | B |
+| Autogen | 02212025 | 615K | 0.771 | B |
 
-Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method. CT-informed metric validated by comparing structure tensor normals against mesh normals at 500 sampled vertices (median alignment 22°, consistent with correctly-segmented papyrus).
+Clean separation: all manual segments score A (>0.9), all autogens score B (<0.81). The main differentiators are self-intersections (0.000 on all autogens vs 1.000 on manual) and topology. Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method.
 
 ## Requirements
 

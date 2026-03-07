@@ -15,7 +15,7 @@ class VolumeAccessor:
 
     def __init__(self, zarr_url: str, scale: int = 0):
         store = fsspec.get_mapper(zarr_url)
-        group = zarr.open(store, mode='r')
+        group = zarr.open(store, mode='r', zarr_format=2)
         self._vol = group[str(scale)]
         self._shape = self._vol.shape  # (Z, Y, X)
         self._scale_factor = 2 ** scale

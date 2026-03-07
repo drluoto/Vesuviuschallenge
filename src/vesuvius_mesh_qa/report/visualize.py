@@ -18,6 +18,7 @@ METRIC_COLORS = {
     "sheet_switching":  np.array([255, 0, 0]),        # red
     "self_intersections": np.array([255, 0, 255]),   # magenta
     "noise":            np.array([0, 128, 255]),      # blue
+    "ct_sheet_switching": np.array([0, 255, 255]),    # cyan
 }
 
 GOOD_COLOR = np.array([180, 220, 180])  # light green

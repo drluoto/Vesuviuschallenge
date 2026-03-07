@@ -363,7 +363,7 @@ class SelfIntersectionMetric(MetricComputer):
     """
 
     name: str = "self_intersections"
-    weight: float = 0.15
+    weight: float = 0.20
 
     def compute(self, mesh: o3d.geometry.TriangleMesh) -> MetricResult:
         vertices = np.asarray(mesh.vertices)
