@@ -316,6 +316,7 @@ def _check_intersections_vectorized(
     tree = cKDTree(centroids)
 
     intersecting_faces: set[int] = set()
+    sampled_hits: set[int] = set()  # only sampled faces that had intersections
     n_intersecting_pairs = 0
 
     k = neighbors_per_sample + 20  # buffer for adjacency exclusion
@@ -337,12 +338,16 @@ def _check_intersections_vectorized(
         n_hits = int(intersects.sum())
         if n_hits > 0:
             n_intersecting_pairs += n_hits
+            sampled_hits.add(si)
             intersecting_faces.add(si)
             for ci in candidates[intersects]:
                 intersecting_faces.add(int(ci))
 
     n_tested = len(sample_indices)
-    intersection_fraction = len(intersecting_faces) / max(n_tested, 1)
+    # Use sampled_hits (not intersecting_faces) for fraction estimate.
+    # sampled_hits only counts faces from the random sample that had
+    # intersections, giving an unbiased estimate of the true fraction.
+    intersection_fraction = len(sampled_hits) / max(n_tested, 1)
 
     if was_subsampled:
         scale = n_faces / n_tested
