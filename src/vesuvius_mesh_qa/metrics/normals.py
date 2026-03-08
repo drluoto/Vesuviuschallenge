@@ -186,8 +186,6 @@ class SheetSwitchingMetric(MetricComputer):
                 details={"error": "mesh has no triangles"},
             )
 
-        n_faces = len(triangles)
-
         # Step 1: per-face normals
         mesh.compute_triangle_normals()
         normals = np.asarray(mesh.triangle_normals).copy()
@@ -196,9 +194,12 @@ class SheetSwitchingMetric(MetricComputer):
         adj, _, _ = _build_face_adjacency_sparse(triangles)
 
         # Step 3: 8-ring neighbourhood via repeated squaring (3 mults vs 7)
-        a2 = adj.dot(adj); a2.data[:] = 1.0
-        a4 = a2.dot(a2); a4.data[:] = 1.0
-        adj_k = a4.dot(a4); adj_k.data[:] = 1.0
+        a2 = adj.dot(adj)
+        a2.data[:] = 1.0
+        a4 = a2.dot(a2)
+        a4.data[:] = 1.0
+        adj_k = a4.dot(a4)
+        adj_k.data[:] = 1.0
 
         # Step 4: smoothed normals
         smoothed = adj_k.dot(normals)

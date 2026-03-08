@@ -209,8 +209,12 @@ def _general_intersection(
     pa2 = np.full(n, a2[0])
     mask_y = proj_axis == 1
     mask_z = proj_axis == 2
-    pa0[mask_y] = a0[1]; pa1[mask_y] = a1[1]; pa2[mask_y] = a2[1]
-    pa0[mask_z] = a0[2]; pa1[mask_z] = a1[2]; pa2[mask_z] = a2[2]
+    pa0[mask_y] = a0[1]
+    pa1[mask_y] = a1[1]
+    pa2[mask_y] = a2[1]
+    pa0[mask_z] = a0[2]
+    pa1[mask_z] = a1[2]
+    pa2[mask_z] = a2[2]
 
     pb0_vals = np.where(proj_axis == 0, b0[:, 0], np.where(proj_axis == 1, b0[:, 1], b0[:, 2]))
     pb1_vals = np.where(proj_axis == 0, b1[:, 0], np.where(proj_axis == 1, b1[:, 1], b1[:, 2]))

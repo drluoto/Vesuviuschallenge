@@ -51,9 +51,12 @@ def _compute_deviation_angles(mesh: o3d.geometry.TriangleMesh) -> np.ndarray:
     normals = np.asarray(mesh.triangle_normals).copy()
 
     adj, _, _ = _build_face_adjacency_sparse(triangles)
-    a2 = adj.dot(adj); a2.data[:] = 1.0
-    a4 = a2.dot(a2); a4.data[:] = 1.0
-    adj_k = a4.dot(a4); adj_k.data[:] = 1.0
+    a2 = adj.dot(adj)
+    a2.data[:] = 1.0
+    a4 = a2.dot(a2)
+    a4.data[:] = 1.0
+    adj_k = a4.dot(a4)
+    adj_k.data[:] = 1.0
 
     smoothed = adj_k.dot(normals)
     norms = np.linalg.norm(smoothed, axis=1, keepdims=True)
