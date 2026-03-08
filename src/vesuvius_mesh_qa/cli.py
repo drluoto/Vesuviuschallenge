@@ -18,6 +18,7 @@ from vesuvius_mesh_qa.metrics.summary import compute_all_metrics, aggregate_scor
 from vesuvius_mesh_qa.report.json_report import build_json_report
 from vesuvius_mesh_qa.report.csv_report import build_csv_row
 from vesuvius_mesh_qa.report.visualize import export_visualization
+from vesuvius_mesh_qa.report.html_viewer import export_html_review
 
 console = Console()
 
@@ -33,9 +34,10 @@ def cli():
 @click.option("--format", "fmt", type=click.Choice(["text", "json"]), default="text")
 @click.option("--weights", type=str, default=None, help="JSON string of metric weight overrides")
 @click.option("--visualize", type=click.Path(), default=None, help="Export colored PLY highlighting problem regions")
+@click.option("--review", type=click.Path(), default=None, help="Export interactive HTML review page")
 @click.option("--volume", type=str, default=None,
               help="OME-Zarr volume URL for CT-informed sheet switching detection")
-def score(path: str, fmt: str, weights: str | None, visualize: str | None, volume: str | None):
+def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
 
@@ -85,6 +87,11 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, volum
         viz_path = Path(visualize)
         export_visualization(mesh, results, viz_path)
         console.print(f"  Visualization saved to [bold]{viz_path}[/bold]")
+
+    if review:
+        review_path = Path(review)
+        export_html_review(mesh, results, agg, grade, review_path, title=mesh_path.stem)
+        console.print(f"  Review page saved to [bold]{review_path}[/bold]")
 
     if fmt == "json":
         report = build_json_report(mesh_path, mesh, results, agg, grade)
