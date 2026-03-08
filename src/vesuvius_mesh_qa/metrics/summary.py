@@ -13,6 +13,7 @@ from vesuvius_mesh_qa.metrics.normals import NormalConsistencyMetric, SheetSwitc
 from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
 from vesuvius_mesh_qa.metrics.noise import NoiseMetric
 from vesuvius_mesh_qa.metrics.ct_switching import CTSheetSwitchingMetric
+from vesuvius_mesh_qa.metrics.winding_angle import WindingAngleMetric, load_umbilicus, UmbilicusFunc
 from vesuvius_mesh_qa.volume import VolumeAccessor
 
 
@@ -31,6 +32,7 @@ def compute_all_metrics(
     weight_overrides: dict[str, float] | None = None,
     on_progress: callable | None = None,
     volume_url: str | None = None,
+    umbilicus: str | tuple[float, float] | None = None,
 ) -> list[MetricResult]:
     """Compute all metrics on a mesh.
 
@@ -42,17 +44,24 @@ def compute_all_metrics(
         volume_url: Optional OME-Zarr volume URL for CT-informed sheet
             switching detection. When provided, a CTSheetSwitchingMetric
             is appended to the default metrics.
+        umbilicus: Optional umbilicus data for winding angle metric.
+            Can be a file path, (x, z) tuple, or "x,z" string.
 
     Returns:
         List of MetricResult from each metric.
     """
-    # Build metrics list: default metrics + optional CT metric
+    # Build metrics list: default metrics + optional CT/winding metrics
     metrics: list[MetricComputer] = [cls() for cls in DEFAULT_METRICS]
 
     if volume_url is not None:
         accessor = VolumeAccessor(volume_url)
         ct_metric = CTSheetSwitchingMetric(accessor)
         metrics.append(ct_metric)
+
+    if umbilicus is not None:
+        umb_func = load_umbilicus(umbilicus)
+        winding_metric = WindingAngleMetric(umb_func)
+        metrics.append(winding_metric)
 
     n_metrics = len(metrics)
     results = []

@@ -37,7 +37,9 @@ def cli():
 @click.option("--review", type=click.Path(), default=None, help="Export interactive HTML review page")
 @click.option("--volume", type=str, default=None,
               help="OME-Zarr volume URL for CT-informed sheet switching detection")
-def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None):
+@click.option("--umbilicus", type=str, default=None,
+              help="Umbilicus data: path to text file, or 'x,z' center point (e.g., '3200,3200')")
+def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
 
@@ -61,6 +63,17 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
 
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
 
+    # Parse umbilicus argument
+    umb_arg = None
+    if umbilicus:
+        if "," in umbilicus and not Path(umbilicus).exists():
+            # Parse "x,z" format
+            parts = umbilicus.split(",")
+            umb_arg = (float(parts[0].strip()), float(parts[1].strip()))
+        else:
+            # File path
+            umb_arg = umbilicus
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -69,7 +82,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
         console=console,
         transient=True,
     ) as progress:
-        n_metrics = 7 if volume else 6
+        n_metrics = 6 + (1 if volume else 0) + (1 if umb_arg else 0)
         task = progress.add_task("Computing metrics...", total=n_metrics)
 
         def _on_progress(name: str, idx: int, total: int):
@@ -77,7 +90,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
 
         results = compute_all_metrics(
             mesh, weight_overrides=weight_overrides, on_progress=_on_progress,
-            volume_url=volume,
+            volume_url=volume, umbilicus=umb_arg,
         )
         progress.update(task, completed=n_metrics)
     agg = aggregate_score(results)
