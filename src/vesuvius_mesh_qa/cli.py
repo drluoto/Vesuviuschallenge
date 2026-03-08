@@ -41,7 +41,11 @@ def cli():
               help="Umbilicus data: path to text file, or 'x,z' center point (e.g., '3200,3200')")
 @click.option("--scroll-config", type=click.Path(exists=True), default=None,
               help="JSON config file with volume_url, umbilicus, and other scroll-specific settings")
-def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None):
+@click.option("--fiber-model", type=click.Path(exists=True), default=None,
+              help="Path to nnUNet fiber model folder for highest-accuracy fiber detection")
+@click.option("--fiber-predictions", type=str, default=None,
+              help="URL/path to pre-computed fiber prediction Zarr store")
+def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None, fiber_model: str | None, fiber_predictions: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
 
@@ -57,6 +61,10 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
                 umbilicus = str(umb_cfg) if not isinstance(umb_cfg, list) else ",".join(str(x) for x in umb_cfg)
             elif cfg.get("umbilicus_simple"):
                 umbilicus = ",".join(str(x) for x in cfg["umbilicus_simple"])
+        if fiber_model is None:
+            fiber_model = cfg.get("fiber_model")
+        if fiber_predictions is None:
+            fiber_predictions = cfg.get("fiber_predictions")
 
     weight_overrides = json.loads(weights) if weights else None
 
@@ -106,6 +114,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
         results = compute_all_metrics(
             mesh, weight_overrides=weight_overrides, on_progress=_on_progress,
             volume_url=volume, umbilicus=umb_arg,
+            fiber_model_path=fiber_model, fiber_predictions_url=fiber_predictions,
         )
         progress.update(task, completed=n_metrics)
     agg = aggregate_score(results)
@@ -176,7 +185,11 @@ def _print_text_report(
 @click.option("--umbilicus", type=str, default=None, help="Umbilicus data: file path or 'x,z'")
 @click.option("--scroll-config", type=click.Path(exists=True), default=None,
               help="JSON config file with scroll-specific settings")
-def batch(directory: str, output: str | None, weights: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None):
+@click.option("--fiber-model", type=click.Path(exists=True), default=None,
+              help="Path to nnUNet fiber model folder")
+@click.option("--fiber-predictions", type=str, default=None,
+              help="URL/path to pre-computed fiber prediction Zarr store")
+def batch(directory: str, output: str | None, weights: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None, fiber_model: str | None, fiber_predictions: str | None):
     """Score all segment meshes in a directory tree, output ranked CSV."""
     # Load scroll config if provided
     if scroll_config:
@@ -190,6 +203,10 @@ def batch(directory: str, output: str | None, weights: str | None, volume: str |
                 umbilicus = str(umb_cfg) if not isinstance(umb_cfg, list) else ",".join(str(x) for x in umb_cfg)
             elif cfg.get("umbilicus_simple"):
                 umbilicus = ",".join(str(x) for x in cfg["umbilicus_simple"])
+        if fiber_model is None:
+            fiber_model = cfg.get("fiber_model")
+        if fiber_predictions is None:
+            fiber_predictions = cfg.get("fiber_predictions")
 
     weight_overrides = json.loads(weights) if weights else None
 
@@ -215,7 +232,8 @@ def batch(directory: str, output: str | None, weights: str | None, volume: str |
         try:
             mesh = load_mesh(seg.obj_path)
             results = compute_all_metrics(mesh, weight_overrides=weight_overrides,
-                                          volume_url=volume, umbilicus=umb_arg)
+                                          volume_url=volume, umbilicus=umb_arg,
+                                          fiber_model_path=fiber_model, fiber_predictions_url=fiber_predictions)
             agg = aggregate_score(results)
             grade = letter_grade(agg)
             row = build_csv_row(seg, mesh, results, agg, grade)
@@ -246,7 +264,8 @@ def batch(directory: str, output: str | None, weights: str | None, volume: str |
     table.add_column("Worst Metric", style="dim")
 
     metric_cols = ["triangle_quality", "topology", "normal_consistency",
-                   "sheet_switching", "self_intersections", "noise"]
+                   "sheet_switching", "self_intersections", "noise",
+                   "ct_sheet_switching", "fiber_coherence", "winding_angle"]
     for _, row in df.iterrows():
         if "error" in row and pd.notna(row.get("error")):
             table.add_row(row["segment_id"], "—", "[red]ERR[/red]", "F", str(row.get("error", ""))[:40])

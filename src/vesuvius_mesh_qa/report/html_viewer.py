@@ -135,6 +135,50 @@ def _build_vertex_colors_winding_angle(
     return (colors * 255).astype(np.uint8)
 
 
+def _build_vertex_colors_fiber(
+    mesh: o3d.geometry.TriangleMesh,
+    results: list[MetricResult],
+) -> np.ndarray | None:
+    """Build per-vertex colors from fiber coherence class data.
+
+    Colors: horizontal fibers = blue, vertical = red, unsampled = gray.
+    Vertices where class flips occur get highlighted in yellow.
+    Returns None if no fiber_coherence result with class data is found.
+    """
+    fiber_result = None
+    for r in results:
+        if r.name == "fiber_coherence" and "fiber_class" in r.details:
+            fiber_result = r
+            break
+    if fiber_result is None:
+        return None
+
+    n_verts = len(mesh.vertices)
+    colors = np.full((n_verts, 3), 128, dtype=np.uint8)  # gray default
+
+    sample_indices = fiber_result.details["sample_indices"]
+    fiber_class = fiber_result.details["fiber_class"]
+
+    for i, vi in enumerate(sample_indices):
+        if vi >= n_verts:
+            continue
+        cls = fiber_class[i]
+        if cls == 1:  # horizontal = blue
+            colors[vi] = [50, 100, 220]
+        elif cls == 2:  # vertical = red
+            colors[vi] = [220, 50, 50]
+
+    # Highlight problem faces (class flips) in yellow
+    if fiber_result.problem_faces is not None:
+        triangles = np.asarray(mesh.triangles)
+        for fi in fiber_result.problem_faces:
+            if fi < len(triangles):
+                for vi in triangles[fi]:
+                    colors[vi] = [255, 220, 50]
+
+    return colors
+
+
 def _build_vertex_colors_heatmap(
     mesh: o3d.geometry.TriangleMesh,
     deviation_deg: np.ndarray,
@@ -377,6 +421,9 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
       <div class="legend-item"><div class="legend-swatch" style="background:#0080ff"></div>Noise</div>
       <div class="legend-item"><div class="legend-swatch" style="background:#ffa500"></div>Triangle quality</div>
       <div class="legend-item"><div class="legend-swatch" style="background:#ffff00"></div>Normal consistency</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#3264dc"></div>Horizontal fibers (fiber view)</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#dc3232"></div>Vertical fibers (fiber view)</div>
+      <div class="legend-item"><div class="legend-swatch" style="background:#ffdc32"></div>Fiber class flip (fiber view)</div>
     </div>
   </div>
 </div>
@@ -394,6 +441,7 @@ const idxB64 = "%(indices_b64)s";
 const colMetricB64 = "%(colors_metric_b64)s";
 const colHeatmapB64 = "%(colors_heatmap_b64)s";
 const colWindingB64 = "%(colors_winding_b64)s";
+const colFiberB64 = "%(colors_fiber_b64)s";
 const clusters = %(clusters_json)s;
 
 function b64ToFloat32(b64) {
@@ -420,17 +468,22 @@ const indices = b64ToUint32(idxB64);
 const colMetricRaw = b64ToUint8(colMetricB64);
 const colHeatmapRaw = b64ToUint8(colHeatmapB64);
 const colWindingRaw = colWindingB64 ? b64ToUint8(colWindingB64) : null;
+const colFiberRaw = colFiberB64 ? b64ToUint8(colFiberB64) : null;
 
 // Pre-convert color sets to float
 const colMetric = new Float32Array(colMetricRaw.length);
 const colHeatmap = new Float32Array(colHeatmapRaw.length);
 const colWinding = colWindingRaw ? new Float32Array(colWindingRaw.length) : null;
+const colFiber = colFiberRaw ? new Float32Array(colFiberRaw.length) : null;
 for (let i = 0; i < colMetricRaw.length; i++) {
   colMetric[i] = colMetricRaw[i] / 255.0;
   colHeatmap[i] = colHeatmapRaw[i] / 255.0;
 }
 if (colWindingRaw) {
   for (let i = 0; i < colWindingRaw.length; i++) colWinding[i] = colWindingRaw[i] / 255.0;
+}
+if (colFiberRaw) {
+  for (let i = 0; i < colFiberRaw.length; i++) colFiber[i] = colFiberRaw[i] / 255.0;
 }
 
 // Setup
@@ -502,6 +555,7 @@ window.setViewMode = function(mode) {
   let src = colMetric;
   if (mode === 'heatmap') src = colHeatmap;
   else if (mode === 'winding' && colWinding) src = colWinding;
+  else if (mode === 'fiber' && colFiber) src = colFiber;
   const arr = colorAttr.array;
   for (let i = 0; i < arr.length; i++) arr[i] = src[i];
   colorAttr.needsUpdate = true;
@@ -645,6 +699,9 @@ def export_html_review(
         except Exception:
             pass  # Gracefully degrade — no winding angle view
 
+    # Build fiber class colors (from metric results, no volume access needed)
+    colors_fiber_orig = _build_vertex_colors_fiber(mesh, results)
+
     # Decimate for viewer
     view_mesh, ratio = _decimate_if_needed(mesh)
 
@@ -666,6 +723,8 @@ def export_html_review(
             colors_winding = orig_colors_winding[nearest]
         else:
             colors_winding = None
+
+        colors_fiber = colors_fiber_orig[nearest] if colors_fiber_orig is not None else None
     else:
         colors_metric = _build_vertex_colors(view_mesh, results)
         colors_heatmap = _build_vertex_colors_heatmap(view_mesh, deviation_deg)
@@ -673,6 +732,7 @@ def export_html_review(
             colors_winding = _build_vertex_colors_winding_angle(view_mesh, winding_angles)
         else:
             colors_winding = None
+        colors_fiber = colors_fiber_orig  # Same mesh, no remapping needed
 
     vertices = np.asarray(view_mesh.vertices).astype(np.float32)
     triangles = np.asarray(view_mesh.triangles).astype(np.uint32)
@@ -682,6 +742,7 @@ def export_html_review(
     colors_metric_b64 = _encode_array(colors_metric.astype(np.uint8).ravel())
     colors_heatmap_b64 = _encode_array(colors_heatmap.astype(np.uint8).ravel())
     colors_winding_b64 = _encode_array(colors_winding.astype(np.uint8).ravel()) if colors_winding is not None else ""
+    colors_fiber_b64 = _encode_array(colors_fiber.astype(np.uint8).ravel()) if colors_fiber is not None else ""
 
     clusters_json = json.dumps(clusters)
 
@@ -740,6 +801,8 @@ def export_html_review(
         '<button class="toggle-btn active" id="btn-metric" onclick="setViewMode(\'metric\')">Metric Colors</button>'
         '<button class="toggle-btn" id="btn-heatmap" onclick="setViewMode(\'heatmap\')">Deviation Heatmap</button>'
     )
+    if colors_fiber is not None:
+        view_buttons += '<button class="toggle-btn" id="btn-fiber" onclick="setViewMode(\'fiber\')">Fiber Classes</button>'
     if colors_winding is not None:
         view_buttons += '<button class="toggle-btn" id="btn-winding" onclick="setViewMode(\'winding\')">Winding Angle</button>'
 
@@ -757,6 +820,7 @@ def export_html_review(
         "colors_metric_b64": colors_metric_b64,
         "colors_heatmap_b64": colors_heatmap_b64,
         "colors_winding_b64": colors_winding_b64,
+        "colors_fiber_b64": colors_fiber_b64,
         "clusters_json": clusters_json,
         "view_buttons": view_buttons,
     }

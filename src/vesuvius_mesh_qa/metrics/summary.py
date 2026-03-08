@@ -27,6 +27,48 @@ DEFAULT_METRICS: list[type[MetricComputer]] = [
     NoiseMetric,
 ]
 
+# Tier-specific weight tables from the design doc.
+# Weights sum to 1.0 within each tier.
+TIER_WEIGHTS: dict[str, dict[str, float]] = {
+    "tier1": {
+        "triangle_quality": 0.10,
+        "topology": 0.10,
+        "normal_consistency": 0.10,
+        "sheet_switching": 0.30,
+        "self_intersections": 0.25,
+        "noise": 0.15,
+    },
+    "tier2": {
+        "triangle_quality": 0.10,
+        "topology": 0.10,
+        "normal_consistency": 0.10,
+        "sheet_switching": 0.20,
+        "self_intersections": 0.20,
+        "noise": 0.10,
+        "ct_sheet_switching": 0.05,
+        "fiber_coherence": 0.15,
+    },
+    "tier3": {
+        "triangle_quality": 0.05,
+        "topology": 0.10,
+        "normal_consistency": 0.05,
+        "sheet_switching": 0.15,
+        "self_intersections": 0.15,
+        "noise": 0.05,
+        "ct_sheet_switching": 0.05,
+        "fiber_coherence": 0.15,
+        "winding_angle": 0.25,
+    },
+}
+
+
+def _detect_tier(has_volume: bool, has_umbilicus: bool) -> str:
+    if has_volume and has_umbilicus:
+        return "tier3"
+    if has_volume:
+        return "tier2"
+    return "tier1"
+
 
 def compute_all_metrics(
     mesh: o3d.geometry.TriangleMesh,
@@ -34,6 +76,8 @@ def compute_all_metrics(
     on_progress: callable | None = None,
     volume_url: str | None = None,
     umbilicus: str | tuple[float, float] | None = None,
+    fiber_model_path: str | None = None,
+    fiber_predictions_url: str | None = None,
 ) -> list[MetricResult]:
     """Compute all metrics on a mesh.
 
@@ -47,6 +91,8 @@ def compute_all_metrics(
             is appended to the default metrics.
         umbilicus: Optional umbilicus data for winding angle metric.
             Can be a file path, (x, z) tuple, or "x,z" string.
+        fiber_model_path: Optional path to nnUNet fiber model folder.
+        fiber_predictions_url: Optional URL/path to pre-computed fiber predictions.
 
     Returns:
         List of MetricResult from each metric.
@@ -58,7 +104,11 @@ def compute_all_metrics(
         accessor = VolumeAccessor(volume_url)
         ct_metric = CTSheetSwitchingMetric(accessor)
         metrics.append(ct_metric)
-        fiber_metric = FiberCoherenceMetric(accessor)
+        fiber_metric = FiberCoherenceMetric(
+            accessor,
+            fiber_model_path=fiber_model_path,
+            fiber_predictions_url=fiber_predictions_url,
+        )
         metrics.append(fiber_metric)
 
     if umbilicus is not None:
@@ -66,9 +116,17 @@ def compute_all_metrics(
         winding_metric = WindingAngleMetric(umb_func)
         metrics.append(winding_metric)
 
+    # Apply tier-appropriate default weights
+    tier = _detect_tier(volume_url is not None, umbilicus is not None)
+    tier_weights = TIER_WEIGHTS[tier]
+    for metric in metrics:
+        if metric.name in tier_weights:
+            metric.weight = tier_weights[metric.name]
+
     n_metrics = len(metrics)
     results = []
     for i, metric in enumerate(metrics):
+        # User overrides take priority over tier defaults
         if weight_overrides and metric.name in weight_overrides:
             metric.weight = weight_overrides[metric.name]
         if on_progress:

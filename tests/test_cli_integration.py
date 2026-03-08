@@ -152,3 +152,36 @@ class TestCLIScrollConfig:
         param_names = [p.name for p in batch.params]
         assert "volume" in param_names
         assert "umbilicus" in param_names
+
+    def test_cli_score_has_fiber_options(self):
+        from vesuvius_mesh_qa.cli import score
+        param_names = [p.name for p in score.params]
+        assert "fiber_model" in param_names
+        assert "fiber_predictions" in param_names
+
+    def test_cli_batch_has_fiber_options(self):
+        from vesuvius_mesh_qa.cli import batch
+        param_names = [p.name for p in batch.params]
+        assert "fiber_model" in param_names
+        assert "fiber_predictions" in param_names
+
+
+class TestTierWeights:
+    """Test that tier-based weight redistribution works correctly."""
+
+    def test_tier1_weights_sum_to_one(self, perfect_plane):
+        from vesuvius_mesh_qa.metrics.summary import compute_all_metrics
+        results = compute_all_metrics(perfect_plane)
+        total = sum(r.weight for r in results)
+        assert abs(total - 1.0) < 0.01, f"Tier 1 weights sum to {total}, expected 1.0"
+
+    def test_tier1_has_6_metrics(self, perfect_plane):
+        from vesuvius_mesh_qa.metrics.summary import compute_all_metrics
+        results = compute_all_metrics(perfect_plane)
+        assert len(results) == 6
+
+    def test_tier1_sheet_switching_weight(self, perfect_plane):
+        from vesuvius_mesh_qa.metrics.summary import compute_all_metrics
+        results = compute_all_metrics(perfect_plane)
+        ss = [r for r in results if r.name == "sheet_switching"][0]
+        assert ss.weight == 0.30
