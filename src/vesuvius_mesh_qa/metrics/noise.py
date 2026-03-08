@@ -103,16 +103,19 @@ class NoiseMetric(MetricComputer):
         pcd.points = o3d.utility.Vector3dVector(vertices[interior_indices])
 
         _, inlier_local = pcd.remove_statistical_outlier(
-            nb_neighbors=20, std_ratio=4.0
+            nb_neighbors=20, std_ratio=5.0
         )
 
         inlier_local_set = set(inlier_local)
         n_outliers = n_interior - len(inlier_local_set)
         outlier_fraction = n_outliers / n_total if n_total > 0 else 0.0
 
-        # Score: 0% outliers -> 1.0, 5%+ outliers -> 0.0
-        clamped = max(0.0, min(outlier_fraction, 0.05))
-        score = 1.0 - clamped * 20.0
+        # Score: 0% outliers -> 1.0, 8%+ outliers -> 0.0
+        # Real papyrus surfaces have natural texture (fibers, ridges) that
+        # causes ~0.5-1% false positive outliers. The 8% threshold avoids
+        # penalising surface detail while still flagging genuinely noisy meshes.
+        clamped = max(0.0, min(outlier_fraction, 0.08))
+        score = 1.0 - clamped * 12.5
 
         # Map outlier indices back to global vertex indices
         outlier_global: set[int] = set()
