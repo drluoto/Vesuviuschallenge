@@ -780,7 +780,7 @@ def export_html_review(
                 f'<div class="cluster-detail">{c["face_count"]} faces | '
                 f'dev: {c["mean_dev"]:.0f}-{c["max_dev"]:.0f}deg | '
                 f'Z-jump: {c["z_jump"]:.0f}</div>'
-                f'<div class="cluster-detail">boundary: {c["boundary_frac"]*100:.0f}%% | '
+                f'<div class="cluster-detail">boundary: {c["boundary_frac"]*100:.0f}% | '
                 f'at ({cx:.0f}, {cy:.0f}, {cz:.0f})</div>'
                 f'<div class="cluster-chart">'
                 f'<canvas id="chart-{i}" width="330" height="120"></canvas></div>'
