@@ -39,9 +39,24 @@ def cli():
               help="OME-Zarr volume URL for CT-informed sheet switching detection")
 @click.option("--umbilicus", type=str, default=None,
               help="Umbilicus data: path to text file, or 'x,z' center point (e.g., '3200,3200')")
-def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None):
+@click.option("--scroll-config", type=click.Path(exists=True), default=None,
+              help="JSON config file with volume_url, umbilicus, and other scroll-specific settings")
+def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None):
     """Score a single mesh file or segment directory."""
     path = Path(path)
+
+    # Load scroll config if provided (CLI flags override config values)
+    if scroll_config:
+        with open(scroll_config) as f:
+            cfg = json.load(f)
+        if volume is None:
+            volume = cfg.get("volume_url")
+        if umbilicus is None:
+            umb_cfg = cfg.get("umbilicus")
+            if umb_cfg is not None:
+                umbilicus = str(umb_cfg) if not isinstance(umb_cfg, list) else ",".join(str(x) for x in umb_cfg)
+            elif cfg.get("umbilicus_simple"):
+                umbilicus = ",".join(str(x) for x in cfg["umbilicus_simple"])
 
     weight_overrides = json.loads(weights) if weights else None
 
@@ -82,7 +97,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
         console=console,
         transient=True,
     ) as progress:
-        n_metrics = 6 + (1 if volume else 0) + (1 if umb_arg else 0)
+        n_metrics = 6 + (2 if volume else 0) + (1 if umb_arg else 0)
         task = progress.add_task("Computing metrics...", total=n_metrics)
 
         def _on_progress(name: str, idx: int, total: int):
@@ -103,7 +118,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
 
     if review:
         review_path = Path(review)
-        export_html_review(mesh, results, agg, grade, review_path, title=mesh_path.stem)
+        export_html_review(mesh, results, agg, grade, review_path, title=mesh_path.stem, umbilicus=umb_arg)
         console.print(f"  Review page saved to [bold]{review_path}[/bold]")
 
     if fmt == "json":
@@ -157,9 +172,35 @@ def _print_text_report(
 @click.argument("directory", type=click.Path(exists=True, file_okay=False))
 @click.option("-o", "--output", type=click.Path(), default=None, help="Output CSV path")
 @click.option("--weights", type=str, default=None, help="JSON string of metric weight overrides")
-def batch(directory: str, output: str | None, weights: str | None):
+@click.option("--volume", type=str, default=None, help="OME-Zarr volume URL for CT metrics")
+@click.option("--umbilicus", type=str, default=None, help="Umbilicus data: file path or 'x,z'")
+@click.option("--scroll-config", type=click.Path(exists=True), default=None,
+              help="JSON config file with scroll-specific settings")
+def batch(directory: str, output: str | None, weights: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None):
     """Score all segment meshes in a directory tree, output ranked CSV."""
+    # Load scroll config if provided
+    if scroll_config:
+        with open(scroll_config) as f:
+            cfg = json.load(f)
+        if volume is None:
+            volume = cfg.get("volume_url")
+        if umbilicus is None:
+            umb_cfg = cfg.get("umbilicus")
+            if umb_cfg is not None:
+                umbilicus = str(umb_cfg) if not isinstance(umb_cfg, list) else ",".join(str(x) for x in umb_cfg)
+            elif cfg.get("umbilicus_simple"):
+                umbilicus = ",".join(str(x) for x in cfg["umbilicus_simple"])
+
     weight_overrides = json.loads(weights) if weights else None
+
+    # Parse umbilicus argument
+    umb_arg = None
+    if umbilicus:
+        if "," in umbilicus and not Path(umbilicus).exists():
+            parts = umbilicus.split(",")
+            umb_arg = (float(parts[0].strip()), float(parts[1].strip()))
+        else:
+            umb_arg = umbilicus
 
     segments = discover_segments(directory)
     if not segments:
@@ -173,7 +214,8 @@ def batch(directory: str, output: str | None, weights: str | None):
         console.print(f"  Scoring [cyan]{seg.segment_id}[/cyan]...")
         try:
             mesh = load_mesh(seg.obj_path)
-            results = compute_all_metrics(mesh, weight_overrides=weight_overrides)
+            results = compute_all_metrics(mesh, weight_overrides=weight_overrides,
+                                          volume_url=volume, umbilicus=umb_arg)
             agg = aggregate_score(results)
             grade = letter_grade(agg)
             row = build_csv_row(seg, mesh, results, agg, grade)

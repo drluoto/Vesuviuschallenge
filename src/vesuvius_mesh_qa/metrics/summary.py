@@ -13,7 +13,8 @@ from vesuvius_mesh_qa.metrics.normals import NormalConsistencyMetric, SheetSwitc
 from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
 from vesuvius_mesh_qa.metrics.noise import NoiseMetric
 from vesuvius_mesh_qa.metrics.ct_switching import CTSheetSwitchingMetric
-from vesuvius_mesh_qa.metrics.winding_angle import WindingAngleMetric, load_umbilicus, UmbilicusFunc
+from vesuvius_mesh_qa.metrics.fiber_coherence import FiberCoherenceMetric
+from vesuvius_mesh_qa.metrics.winding_angle import WindingAngleMetric, load_umbilicus
 from vesuvius_mesh_qa.volume import VolumeAccessor
 
 
@@ -57,6 +58,8 @@ def compute_all_metrics(
         accessor = VolumeAccessor(volume_url)
         ct_metric = CTSheetSwitchingMetric(accessor)
         metrics.append(ct_metric)
+        fiber_metric = FiberCoherenceMetric(accessor)
+        metrics.append(fiber_metric)
 
     if umbilicus is not None:
         umb_func = load_umbilicus(umbilicus)

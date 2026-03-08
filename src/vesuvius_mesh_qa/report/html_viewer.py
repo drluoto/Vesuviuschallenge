@@ -14,10 +14,10 @@ from pathlib import Path
 
 import numpy as np
 import open3d as o3d
-from scipy import sparse
 
 from vesuvius_mesh_qa.metrics.base import MetricResult
 from vesuvius_mesh_qa.metrics.normals import _build_face_adjacency_sparse
+from vesuvius_mesh_qa.metrics.winding_angle import compute_winding_angles_bfs, load_umbilicus
 
 # Maximum faces for the HTML viewer (decimate larger meshes)
 MAX_VIEWER_FACES = 200_000
@@ -82,6 +82,57 @@ def _find_boundary_faces(mesh: o3d.geometry.TriangleMesh) -> set[int]:
         if len(faces) == 1:
             boundary_faces.add(faces[0])
     return boundary_faces
+
+
+def _build_vertex_colors_winding_angle(
+    mesh: o3d.geometry.TriangleMesh,
+    winding_angles: np.ndarray,
+) -> np.ndarray:
+    """Build per-vertex rainbow colors from accumulated winding angles.
+
+    Maps winding angle range to HSV hue (0-360), producing a rainbow gradient
+    around the scroll. Discontinuities = color jumps = sheet switches.
+    """
+    n_verts = len(mesh.vertices)
+    # All finite angles are valid (0.0 is a valid angle — it's the BFS seed).
+    # Only NaN/inf (unvisited vertices in disconnected components) are invalid.
+    valid = np.isfinite(winding_angles)
+
+    if not np.any(valid):
+        return np.full((n_verts, 3), 128, dtype=np.uint8)
+
+    # Normalize to [0, 1] over the observed range
+    wa_min = winding_angles[valid].min()
+    wa_max = winding_angles[valid].max()
+    wa_range = wa_max - wa_min
+    if wa_range < 1e-6:
+        return np.full((n_verts, 3), 128, dtype=np.uint8)
+
+    t = np.clip((winding_angles - wa_min) / wa_range, 0.0, 1.0)
+
+    # HSV to RGB: hue = t * 300° (red→yellow→green→cyan→blue→magenta, skip wrap)
+    hue = np.clip(t * 300.0, 0.0, 299.99)  # clamp to avoid boundary
+    h_prime = hue / 60.0
+
+    colors = np.zeros((n_verts, 3), dtype=np.float64)
+    for sector in range(5):  # 0-4 covers 0-300°
+        mask = (h_prime >= sector) & (h_prime < sector + 1)
+        frac = h_prime[mask] - sector
+        if sector == 0:    # red to yellow
+            colors[mask] = np.column_stack([np.ones(mask.sum()), frac, np.zeros(mask.sum())])
+        elif sector == 1:  # yellow to green
+            colors[mask] = np.column_stack([1 - frac, np.ones(mask.sum()), np.zeros(mask.sum())])
+        elif sector == 2:  # green to cyan
+            colors[mask] = np.column_stack([np.zeros(mask.sum()), np.ones(mask.sum()), frac])
+        elif sector == 3:  # cyan to blue
+            colors[mask] = np.column_stack([np.zeros(mask.sum()), 1 - frac, np.ones(mask.sum())])
+        elif sector == 4:  # blue to magenta
+            colors[mask] = np.column_stack([frac, np.zeros(mask.sum()), np.ones(mask.sum())])
+
+    # Invalid vertices get gray
+    colors[~valid] = [0.5, 0.5, 0.5]
+
+    return (colors * 255).astype(np.uint8)
 
 
 def _build_vertex_colors_heatmap(
@@ -310,10 +361,7 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
     <h2>Metrics</h2>
     <div id="metrics">%(metrics_html)s</div>
     <h2>View Mode</h2>
-    <div>
-      <button class="toggle-btn active" id="btn-metric" onclick="setViewMode('metric')">Metric Colors</button>
-      <button class="toggle-btn" id="btn-heatmap" onclick="setViewMode('heatmap')">Deviation Heatmap</button>
-    </div>
+    <div>%(view_buttons)s</div>
     <h2>Sheet Switching Clusters (%(n_clusters)s found)</h2>
     <div class="help-text">
       Click a cluster to zoom in. Cross-section shows Z-height profile
@@ -345,6 +393,7 @@ const posB64 = "%(positions_b64)s";
 const idxB64 = "%(indices_b64)s";
 const colMetricB64 = "%(colors_metric_b64)s";
 const colHeatmapB64 = "%(colors_heatmap_b64)s";
+const colWindingB64 = "%(colors_winding_b64)s";
 const clusters = %(clusters_json)s;
 
 function b64ToFloat32(b64) {
@@ -370,13 +419,18 @@ const positions = b64ToFloat32(posB64);
 const indices = b64ToUint32(idxB64);
 const colMetricRaw = b64ToUint8(colMetricB64);
 const colHeatmapRaw = b64ToUint8(colHeatmapB64);
+const colWindingRaw = colWindingB64 ? b64ToUint8(colWindingB64) : null;
 
-// Pre-convert both color sets to float
+// Pre-convert color sets to float
 const colMetric = new Float32Array(colMetricRaw.length);
 const colHeatmap = new Float32Array(colHeatmapRaw.length);
+const colWinding = colWindingRaw ? new Float32Array(colWindingRaw.length) : null;
 for (let i = 0; i < colMetricRaw.length; i++) {
   colMetric[i] = colMetricRaw[i] / 255.0;
   colHeatmap[i] = colHeatmapRaw[i] / 255.0;
+}
+if (colWindingRaw) {
+  for (let i = 0; i < colWindingRaw.length; i++) colWinding[i] = colWindingRaw[i] / 255.0;
 }
 
 // Setup
@@ -445,12 +499,15 @@ clusters.forEach((c, i) => {
 
 // View mode toggle
 window.setViewMode = function(mode) {
-  const src = mode === 'heatmap' ? colHeatmap : colMetric;
+  let src = colMetric;
+  if (mode === 'heatmap') src = colHeatmap;
+  else if (mode === 'winding' && colWinding) src = colWinding;
   const arr = colorAttr.array;
   for (let i = 0; i < arr.length; i++) arr[i] = src[i];
   colorAttr.needsUpdate = true;
-  document.getElementById('btn-metric').classList.toggle('active', mode === 'metric');
-  document.getElementById('btn-heatmap').classList.toggle('active', mode === 'heatmap');
+  document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('btn-' + mode);
+  if (btn) btn.classList.add('active');
 };
 
 // Draw cross-section chart on a canvas
@@ -562,14 +619,31 @@ def export_html_review(
     grade: str,
     output_path: Path,
     title: str = "Segment",
+    umbilicus: str | tuple[float, float] | np.ndarray | None = None,
 ) -> None:
-    """Export an interactive HTML review page for the mesh."""
+    """Export an interactive HTML review page for the mesh.
+
+    Args:
+        umbilicus: Optional umbilicus data for winding angle rainbow view.
+            Can be a file path, (x, z) tuple, or numpy array.
+    """
     n_faces_orig = len(mesh.triangles)
 
     # Compute diagnostics on the ORIGINAL mesh before decimation
     deviation_deg = _compute_deviation_angles(mesh)
     boundary_faces = _find_boundary_faces(mesh)
     clusters = _extract_clusters_with_diagnostics(mesh, results, deviation_deg, boundary_faces)
+
+    # Compute winding angles if umbilicus is available
+    winding_angles = None
+    if umbilicus is not None:
+        try:
+            umb_func = load_umbilicus(umbilicus)
+            verts = np.asarray(mesh.vertices)
+            tris = np.asarray(mesh.triangles)
+            winding_angles = compute_winding_angles_bfs(verts, tris, umb_func)
+        except Exception:
+            pass  # Gracefully degrade — no winding angle view
 
     # Decimate for viewer
     view_mesh, ratio = _decimate_if_needed(mesh)
@@ -586,9 +660,19 @@ def export_html_review(
         _, nearest = tree.query(dec_verts)
         colors_metric = orig_colors_metric[nearest]
         colors_heatmap = orig_colors_heatmap[nearest]
+
+        if winding_angles is not None:
+            orig_colors_winding = _build_vertex_colors_winding_angle(mesh, winding_angles)
+            colors_winding = orig_colors_winding[nearest]
+        else:
+            colors_winding = None
     else:
         colors_metric = _build_vertex_colors(view_mesh, results)
         colors_heatmap = _build_vertex_colors_heatmap(view_mesh, deviation_deg)
+        if winding_angles is not None:
+            colors_winding = _build_vertex_colors_winding_angle(view_mesh, winding_angles)
+        else:
+            colors_winding = None
 
     vertices = np.asarray(view_mesh.vertices).astype(np.float32)
     triangles = np.asarray(view_mesh.triangles).astype(np.uint32)
@@ -597,6 +681,7 @@ def export_html_review(
     indices_b64 = _encode_array(triangles.ravel())
     colors_metric_b64 = _encode_array(colors_metric.astype(np.uint8).ravel())
     colors_heatmap_b64 = _encode_array(colors_heatmap.astype(np.uint8).ravel())
+    colors_winding_b64 = _encode_array(colors_winding.astype(np.uint8).ravel()) if colors_winding is not None else ""
 
     clusters_json = json.dumps(clusters)
 
@@ -650,6 +735,14 @@ def export_html_review(
 
     grade_class = f"score-{grade.lower()}"
 
+    # Build dynamic view mode buttons
+    view_buttons = (
+        '<button class="toggle-btn active" id="btn-metric" onclick="setViewMode(\'metric\')">Metric Colors</button>'
+        '<button class="toggle-btn" id="btn-heatmap" onclick="setViewMode(\'heatmap\')">Deviation Heatmap</button>'
+    )
+    if colors_winding is not None:
+        view_buttons += '<button class="toggle-btn" id="btn-winding" onclick="setViewMode(\'winding\')">Winding Angle</button>'
+
     html = HTML_TEMPLATE % {
         "title": title,
         "aggregate_fmt": f"{aggregate:.3f}",
@@ -663,7 +756,9 @@ def export_html_review(
         "indices_b64": indices_b64,
         "colors_metric_b64": colors_metric_b64,
         "colors_heatmap_b64": colors_heatmap_b64,
+        "colors_winding_b64": colors_winding_b64,
         "clusters_json": clusters_json,
+        "view_buttons": view_buttons,
     }
 
     output_path = Path(output_path)

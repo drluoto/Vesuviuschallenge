@@ -1,0 +1,7 @@
+{
+  "scroll_name": "PHerc1667",
+  "volume_url": "https://data.aws.ash2txt.org/samples/PHerc1667/volumes/20231117161658-7.910um-53keV-masked.zarr/",
+  "umbilicus_simple": [3200, 3200],
+  "voxel_size_um": 7.91,
+  "notes": "Main community scroll. Umbilicus is approximate center point."
+}

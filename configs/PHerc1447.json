@@ -1,0 +1,7 @@
+{
+  "scroll_name": "PHerc1447",
+  "volume_url": "https://data.aws.ash2txt.org/samples/PHerc1447/volumes/20250521151220-8.640um-1.2m-116keV-masked.zarr/",
+  "umbilicus_simple": [3200, 3200],
+  "voxel_size_um": 8.64,
+  "notes": "Second main scroll. Umbilicus is approximate."
+}

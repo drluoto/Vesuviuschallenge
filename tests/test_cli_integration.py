@@ -39,8 +39,9 @@ class TestComputeAllMetricsWithVolume:
             mock_ct_cls.return_value = mock_ct_instance
 
             results = compute_all_metrics(perfect_plane, volume_url="s3://fake/volume")
-            assert len(results) == 7
-            assert results[-1].name == "ct_sheet_switching"
+            assert len(results) == 8  # 6 base + CT + fiber_coherence
+            metric_names = [r.name for r in results]
+            assert "ct_sheet_switching" in metric_names
             mock_va_cls.assert_called_once_with("s3://fake/volume")
             mock_ct_cls.assert_called_once_with(mock_accessor)
 
@@ -78,8 +79,8 @@ class TestComputeAllMetricsWithVolume:
                 perfect_plane, volume_url="s3://fake/volume", on_progress=on_progress,
             )
 
-        # All progress reports should show total=7
-        assert all(t == 7 for t in totals_seen), f"Expected all totals=7, got {totals_seen}"
+        # All progress reports should show total=8 (6 base + CT + fiber)
+        assert all(t == 8 for t in totals_seen), f"Expected all totals=8, got {totals_seen}"
 
     def test_progress_callback_total_without_volume(self, perfect_plane):
         """Progress callback should report total=6 when no volume."""
@@ -131,3 +132,23 @@ class TestCLIVolumeOption:
         volume_param = [p for p in score.params if p.name == "volume"][0]
         assert volume_param.default is None
         assert not volume_param.required
+
+
+class TestCLIScrollConfig:
+    """Test that the CLI accepts --scroll-config option."""
+
+    def test_cli_score_has_scroll_config_option(self):
+        from vesuvius_mesh_qa.cli import score
+        param_names = [p.name for p in score.params]
+        assert "scroll_config" in param_names
+
+    def test_cli_batch_has_scroll_config_option(self):
+        from vesuvius_mesh_qa.cli import batch
+        param_names = [p.name for p in batch.params]
+        assert "scroll_config" in param_names
+
+    def test_cli_batch_has_volume_and_umbilicus(self):
+        from vesuvius_mesh_qa.cli import batch
+        param_names = [p.name for p in batch.params]
+        assert "volume" in param_names
+        assert "umbilicus" in param_names
