@@ -18,7 +18,10 @@ class TestVolumeAccessor:
         accessor = VolumeAccessor.__new__(VolumeAccessor)
         accessor._vol = mock_array
         accessor._shape = mock_array.shape
+        accessor._chunks = (128, 128, 128)
         accessor._scale_factor = 1
+        accessor._cache = MagicMock()
+        accessor._cache.get.return_value = None  # No cache hits
 
         # Vertex at (250, 250, 500) -> volume index [500, 250, 250]
         chunk = accessor.sample_neighborhood(

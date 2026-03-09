@@ -11,6 +11,7 @@ import pytest
 from vesuvius_mesh_qa.metrics.fiber_coherence import (
     FiberCoherenceMetric,
     _compute_fiber_orientation_manual,
+    _find_nnunet_model_dir,
 )
 
 
@@ -122,3 +123,33 @@ class TestStructureTensorComputation:
         assert len(anisotropy) == 2
         # At least one should be classified
         assert np.any(fiber_class > 0)
+
+
+class TestNnUNetModelDiscovery:
+    def test_find_model_dir(self, tmp_path):
+        """Should find the nnUNet trainer directory."""
+        # Create mock directory structure
+        d040 = tmp_path / "Dataset040_newHorizontals" / "nnUNetTrainer__nnUNetResEncUNetPlans_16G__3d_fullres" / "fold_0"
+        d040.mkdir(parents=True)
+        (d040.parent / "dataset.json").write_text("{}")
+        (d040.parent / "plans.json").write_text("{}")
+
+        result = _find_nnunet_model_dir(str(tmp_path), "Dataset040")
+        assert result is not None
+        assert "Dataset040" in result
+        assert "16G" in result
+
+    def test_find_model_dir_missing(self, tmp_path):
+        """Should return None if dataset not found."""
+        result = _find_nnunet_model_dir(str(tmp_path), "Dataset040")
+        assert result is None
+
+    def test_prefers_16g_over_40g(self, tmp_path):
+        """Should prefer 16G variant over 40G for lower memory."""
+        for variant in ["nnUNetTrainer__nnUNetResEncUNetPlans_16G__3d_fullres",
+                        "nnUNetTrainer__nnUNetResEncUNetPlans_40G__3d_fullres"]:
+            d = tmp_path / "Dataset040_newHorizontals" / variant / "fold_0"
+            d.mkdir(parents=True)
+
+        result = _find_nnunet_model_dir(str(tmp_path), "Dataset040")
+        assert "16G" in result

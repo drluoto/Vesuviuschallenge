@@ -248,33 +248,180 @@ def _build_vertex_colors(
     return vertex_colors.astype(np.uint8)
 
 
+def _cluster_faces_bfs(
+    face_indices: set[int],
+    triangles: np.ndarray,
+    min_cluster_faces: int = 5,
+) -> list[list[int]]:
+    """Cluster a set of face indices into connected components via BFS.
+
+    Uses edge-based face adjacency: two faces are adjacent if they share an edge.
+    Returns clusters with at least `min_cluster_faces` faces.
+    """
+    from collections import deque
+
+    if not face_indices:
+        return []
+
+    # Build face adjacency for the subset
+    n_faces = len(triangles)
+    edge_to_faces: dict[tuple[int, int], list[int]] = {}
+    for fi in face_indices:
+        if fi >= n_faces:
+            continue
+        tri = triangles[fi]
+        for a, b in [(0, 1), (1, 2), (2, 0)]:
+            edge = (min(int(tri[a]), int(tri[b])), max(int(tri[a]), int(tri[b])))
+            edge_to_faces.setdefault(edge, []).append(fi)
+
+    # Build adjacency from shared edges
+    adj: dict[int, set[int]] = {fi: set() for fi in face_indices}
+    for faces in edge_to_faces.values():
+        for i in range(len(faces)):
+            for j in range(i + 1, len(faces)):
+                adj[faces[i]].add(faces[j])
+                adj[faces[j]].add(faces[i])
+
+    # BFS clustering
+    remaining = set(face_indices)
+    clusters: list[list[int]] = []
+    while remaining:
+        seed = next(iter(remaining))
+        cluster: list[int] = []
+        queue: deque[int] = deque([seed])
+        remaining.discard(seed)
+        while queue:
+            current = queue.popleft()
+            cluster.append(current)
+            for nb in adj.get(current, set()):
+                if nb in remaining:
+                    remaining.discard(nb)
+                    queue.append(nb)
+        if len(cluster) >= min_cluster_faces:
+            clusters.append(cluster)
+
+    return clusters
+
+
+# Map metric names to short source tags for the cluster panel.
+# CT is excluded: structure tensor is too noisy (~25-30° baseline) for
+# reliable spatial detection. CT contributes via its global score only.
+# Spatial detection uses community-validated approaches: fiber patterns
+# and winding angle consistency.
+_METRIC_SOURCE_TAGS: dict[str, str] = {
+    "sheet_switching": "GEOM",
+    "fiber_coherence": "FIBER",
+    "winding_angle": "WINDING",
+}
+
+
 def _extract_clusters_with_diagnostics(
     mesh: o3d.geometry.TriangleMesh,
     results: list[MetricResult],
     deviation_deg: np.ndarray,
     boundary_faces: set[int],
 ) -> list[dict]:
-    """Extract sheet switching clusters with cross-section and boundary data."""
+    """Extract problem clusters from ALL metrics with cross-section and boundary data.
+
+    Gathers problem_faces from sheet_switching (GEOM), ct_sheet_switching (CT),
+    fiber_coherence (FIBER), and winding_angle (WINDING) metrics. Clusters each
+    source's faces spatially, then merges overlapping clusters from different
+    sources so a single region can carry multiple source tags.
+    """
     vertices = np.asarray(mesh.vertices)
     triangles = np.asarray(mesh.triangles)
     face_centroids = vertices[triangles].mean(axis=1)
 
-    sheet_result = None
+    # --- Gather per-source clusters ---
+    # Each entry: (cluster_faces, source_tag)
+    tagged_clusters: list[tuple[list[int], set[str]]] = []
+
     for r in results:
+        tag = _METRIC_SOURCE_TAGS.get(r.name)
+        if tag is None:
+            continue
+
         if r.name == "sheet_switching":
-            sheet_result = r
-            break
-    if sheet_result is None or "problem_regions" not in sheet_result.details:
+            # Use pre-computed problem_regions for GEOM (they have centroid info)
+            if "problem_regions" not in r.details:
+                continue
+            problem_set = set()
+            if r.problem_faces is not None:
+                problem_set = set(r.problem_faces.tolist())
+            for region in r.details["problem_regions"]:
+                # Reconstruct face list from problem_faces near this region centroid
+                centroid = np.array(region["centroid"])
+                fc = region["face_count"]
+                # Find the fc closest problem faces to this centroid
+                if problem_set:
+                    pf_arr = np.array(list(problem_set))
+                    pf_dists = np.linalg.norm(face_centroids[pf_arr] - centroid, axis=1)
+                    closest = pf_arr[np.argsort(pf_dists)[:fc]]
+                    tagged_clusters.append((closest.tolist(), {tag}))
+        else:
+            # CT, FIBER, WINDING: cluster their problem_faces spatially
+            if r.problem_faces is None or len(r.problem_faces) == 0:
+                continue
+            pf_set = set(r.problem_faces.tolist())
+            spatial_clusters = _cluster_faces_bfs(pf_set, triangles, min_cluster_faces=5)
+            for cluster in spatial_clusters:
+                tagged_clusters.append((cluster, {tag}))
+
+    if not tagged_clusters:
         return []
 
-    problem_set = set()
-    if sheet_result.problem_faces is not None:
-        problem_set = set(sheet_result.problem_faces.tolist())
+    # --- Merge overlapping clusters from different sources ---
+    # Two clusters overlap if they share any face indices
+    # Build face -> cluster index mapping
+    face_to_cluster: dict[int, int] = {}
+    merged: list[tuple[set[int], set[str]]] = []
+
+    for faces, tags in tagged_clusters:
+        face_set = set(faces)
+        # Find all existing clusters this overlaps with
+        overlapping_ids: set[int] = set()
+        for f in face_set:
+            if f in face_to_cluster:
+                overlapping_ids.add(face_to_cluster[f])
+
+        if not overlapping_ids:
+            # New cluster
+            idx = len(merged)
+            merged.append((face_set, set(tags)))
+            for f in face_set:
+                face_to_cluster[f] = idx
+        else:
+            # Merge into the first overlapping cluster
+            target_id = min(overlapping_ids)
+            target_faces, target_tags = merged[target_id]
+            target_faces.update(face_set)
+            target_tags.update(tags)
+            # Merge other overlapping clusters into target
+            for oid in overlapping_ids:
+                if oid != target_id:
+                    of, ot = merged[oid]
+                    target_faces.update(of)
+                    target_tags.update(ot)
+                    merged[oid] = (set(), set())  # empty placeholder
+                    for f in of:
+                        face_to_cluster[f] = target_id
+            for f in face_set:
+                face_to_cluster[f] = target_id
+
+    # Filter out empty placeholders and small clusters
+    final_clusters = [(faces, tags) for faces, tags in merged if len(faces) >= 5]
+
+    # --- Build enriched cluster dicts ---
+    all_problem_faces = set()
+    for faces, _ in final_clusters:
+        all_problem_faces.update(faces)
 
     clusters = []
-    for i, region in enumerate(sheet_result.details["problem_regions"]):
-        centroid = np.array(region["centroid"])
-        fc = region["face_count"]
+    for i, (face_set, tags) in enumerate(final_clusters):
+        face_list = sorted(face_set)
+        face_arr = np.array(face_list)
+        centroid = face_centroids[face_arr].mean(axis=0)
+        fc = len(face_list)
 
         # Find nearby faces for cross-section
         dists = np.linalg.norm(face_centroids - centroid, axis=1)
@@ -285,28 +432,25 @@ def _extract_clusters_with_diagnostics(
         nearby_z = nearby_centroids[:, 2].tolist()
         nearby_x = nearby_centroids[:, 0].tolist()
         nearby_y = nearby_centroids[:, 1].tolist()
-        nearby_flagged = [int(nearby_idx[j]) in problem_set for j in range(len(nearby_idx))]
+        nearby_flagged = [int(nearby_idx[j]) in all_problem_faces for j in range(len(nearby_idx))]
 
         # Deviation stats for this cluster's faces
-        cluster_devs = deviation_deg[nearby_idx[nearby_flagged]]
+        cluster_devs = deviation_deg[face_arr]
         mean_dev = float(np.mean(cluster_devs)) if len(cluster_devs) > 0 else 0.0
         max_dev = float(np.max(cluster_devs)) if len(cluster_devs) > 0 else 0.0
 
-        # Boundary proximity: what fraction of flagged faces are boundary faces
-        flagged_nearby = nearby_idx[nearby_flagged]
-        n_boundary = sum(1 for f in flagged_nearby if int(f) in boundary_faces)
-        boundary_frac = n_boundary / max(len(flagged_nearby), 1)
+        # Boundary proximity
+        n_boundary = sum(1 for f in face_list if f in boundary_faces)
+        boundary_frac = n_boundary / max(fc, 1)
 
-        # Z-range analysis: is there a Z-discontinuity?
+        # Z-range analysis
         flagged_z = np.array([nearby_z[j] for j in range(len(nearby_idx)) if nearby_flagged[j]])
         good_z = np.array([nearby_z[j] for j in range(len(nearby_idx)) if not nearby_flagged[j]])
-
         z_jump = 0.0
         if len(flagged_z) > 0 and len(good_z) > 0:
-            # Check if flagged faces have different Z from nearby good faces
             z_jump = abs(float(np.median(flagged_z) - np.median(good_z)))
 
-        # Subsample cross-section data to keep HTML small (max 200 points)
+        # Subsample cross-section data (max 200 points)
         step = max(1, len(nearby_idx) // 200)
         cs_x = nearby_x[::step]
         cs_y = nearby_y[::step]
@@ -318,7 +462,8 @@ def _extract_clusters_with_diagnostics(
         clusters.append({
             "id": i,
             "face_count": fc,
-            "centroid": region["centroid"],
+            "centroid": centroid.tolist(),
+            "sources": sorted(tags),
             "mean_dev": round(mean_dev, 1),
             "max_dev": round(max_dev, 1),
             "boundary_frac": round(boundary_frac, 2),
@@ -332,8 +477,8 @@ def _extract_clusters_with_diagnostics(
             },
         })
 
-    # Sort by face count descending, limit display
-    clusters.sort(key=lambda c: c["face_count"], reverse=True)
+    # Sort by number of sources (multi-detector hits first), then face count
+    clusters.sort(key=lambda c: (len(c["sources"]), c["face_count"]), reverse=True)
     return clusters[:MAX_DISPLAY_CLUSTERS]
 
 
@@ -377,6 +522,12 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
                  font-weight: bold; }
 .badge-boundary { background: #ff9800; color: #000; }
 .badge-suspicious { background: #f44336; color: #fff; }
+.badge-source { font-size: 9px; padding: 1px 5px; border-radius: 3px;
+                font-weight: bold; margin-left: 3px; }
+.badge-GEOM { background: #f44336; color: #fff; }
+.badge-CT { background: #9c27b0; color: #fff; }
+.badge-FIBER { background: #2196f3; color: #fff; }
+.badge-WINDING { background: #4caf50; color: #fff; }
 .cluster-detail { font-size: 11px; color: #888; margin-top: 4px; }
 .cluster-chart { margin-top: 8px; background: #0a1a3a; border-radius: 4px;
                  padding: 4px; }
@@ -409,11 +560,11 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
     <div id="metrics">%(metrics_html)s</div>
     <h2>View Mode</h2>
     <div>%(view_buttons)s</div>
-    <h2>Sheet Switching Clusters (%(n_clusters)s found)</h2>
+    <h2>Problem Clusters (%(n_clusters)s found)</h2>
     <div class="help-text">
-      Click a cluster to zoom in. Cross-section shows Z-height profile
-      (red=flagged, green=good). A Z-jump suggests a real sheet switch.
-      Boundary clusters are often false positives.
+      Click a cluster to zoom in. Tags show which detectors flagged each region:
+      GEOM (geometry), CT (volume), FIBER (coherence), WINDING (angle).
+      Multi-tag clusters are highest confidence. Boundary clusters may be false positives.
     </div>
     <div id="clusters">%(clusters_html)s</div>
     <div class="legend">
@@ -760,26 +911,31 @@ def export_html_review(
             f'</div>'
         )
 
-    # Build clusters HTML with cross-section canvases
-    n_total_clusters = 0
-    for r in results:
-        if r.name == "sheet_switching":
-            n_total_clusters = r.details.get("n_switch_regions", 0)
+    # Build clusters HTML with cross-section canvases and source tags
+    n_total_clusters = len(clusters)
 
     if clusters:
         clusters_html = ""
         for i, c in enumerate(clusters):
             cx, cy, cz = c["centroid"]
-            badge = ""
+
+            # Source tags (GEOM, CT, FIBER, WINDING)
+            source_badges = ""
+            for src in c.get("sources", []):
+                source_badges += f'<span class="badge-source badge-{src}">{src}</span>'
+
+            # Status badges
+            status_badge = ""
             if c["is_boundary"]:
-                badge = '<span class="cluster-badge badge-boundary">BOUNDARY</span>'
+                status_badge = '<span class="cluster-badge badge-boundary">BOUNDARY</span>'
             elif c["z_jump"] > 50:
-                badge = '<span class="cluster-badge badge-suspicious">Z-JUMP</span>'
+                status_badge = '<span class="cluster-badge badge-suspicious">Z-JUMP</span>'
 
             clusters_html += (
                 f'<div class="cluster-card" id="cluster-{i}" data-idx="{i}">'
                 f'<div class="cluster-header">'
-                f'<span class="cluster-id">Cluster {i+1}</span>{badge}</div>'
+                f'<span class="cluster-id">Cluster {i+1}</span>'
+                f'<span>{source_badges}{status_badge}</span></div>'
                 f'<div class="cluster-detail">{c["face_count"]} faces | '
                 f'dev: {c["mean_dev"]:.0f}-{c["max_dev"]:.0f}deg | '
                 f'Z-jump: {c["z_jump"]:.0f}</div>'
@@ -789,13 +945,8 @@ def export_html_review(
                 f'<canvas id="chart-{i}" width="330" height="120"></canvas></div>'
                 f'</div>'
             )
-        if n_total_clusters > len(clusters):
-            clusters_html += (
-                f'<div class="help-text">Showing top {len(clusters)} of '
-                f'{n_total_clusters} clusters by size</div>'
-            )
     else:
-        clusters_html = '<div class="no-clusters">No sheet switching detected</div>'
+        clusters_html = '<div class="no-clusters">No problem clusters detected</div>'
 
     grade_class = f"score-{grade.lower()}"
 

@@ -42,7 +42,7 @@ def cli():
 @click.option("--scroll-config", type=click.Path(exists=True), default=None,
               help="JSON config file with volume_url, umbilicus, and other scroll-specific settings")
 @click.option("--fiber-model", type=click.Path(exists=True), default=None,
-              help="Path to nnUNet fiber model folder for highest-accuracy fiber detection")
+              help="Path to directory containing bruniss nnUNet fiber models (Dataset040_newHorizontals/ and Dataset041_newVerticals/)")
 @click.option("--fiber-predictions", type=str, default=None,
               help="URL/path to pre-computed fiber prediction Zarr store")
 def score(path: str, fmt: str, weights: str | None, visualize: str | None, review: str | None, volume: str | None, umbilicus: str | None, scroll_config: str | None, fiber_model: str | None, fiber_predictions: str | None):

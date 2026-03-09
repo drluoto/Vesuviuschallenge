@@ -105,51 +105,62 @@ To classify fiber orientation (horizontal vs vertical): compute the dot product 
 
 bruniss's $20K prize-winning fiber detection model is a standard nnUNetv2 trained on micro-CT data. It is the community's gold standard for fiber detection.
 
-**Model details** (from reading the actual codebase and training configs):
-- **Architecture**: `PlainConvUNet` (nnUNet default 3D UNet), 6 encoder stages, features [32, 64, 128, 256, 320, 320]
-- **Training data**: Dataset004_fiber3 — 6 manually labeled volumes (labels created in Dragonfly 3D)
-- **Input**: Raw 3D micro-CT, single channel, uint16. Z-score normalized (mean=7534, std=16854)
-- **Patch size**: [64, 160, 224] voxels (ZYX), batch size 2
-- **Output**: Per-voxel class labels — 0=background, 1=horizontal fibers, 2=vertical fibers
-- **Checkpoint**: ~238 MB (`checkpoint_final.pth`)
+**Model details — bruniss newer models (Dataset040/041, ACTIVE):**
+
+bruniss released improved fiber detection models with more training data. These are TWO separate binary segmentation models:
+- **Dataset040_newHorizontals**: detects horizontal fibers (bg=0, fiber=1)
+- **Dataset041_newVerticals**: detects vertical fibers (bg=0, fiber=1)
+- **Architecture**: `ResidualEncoderUNet` (nnUNetResEncUNetPlans_16G variant for 16GB VRAM)
+- **Training data**: 41 manually labeled 3D CT volumes each
+- **Input**: Raw 3D micro-CT, single channel. Isotropic 1.0 spacing.
+- **Output**: Per-voxel binary labels — 0=background, 1=fiber
+- **Checkpoint**: ~781 MB each (`checkpoint_final.pth`)
 - **Inference**: Standard `nnUNetPredictor` API, supports MPS (Apple Silicon)
+- **Combined output**: Run both models, combine: hz=1→class 1, vt=1→class 2, both→higher confidence wins
 
 **Model weights availability**:
-- Original URL (README link) returns 404
+- Directory listing: `dl.ash2txt.org/community-uploads/bruniss/old_models/Dataset040_newHorizontals/` and `Dataset041_newVerticals/`
+- We download only the `nnUNetTrainer__nnUNetResEncUNetPlans_16G__3d_fullres/` variant (lower memory) with `fold_0/checkpoint_final.pth` + metadata files
+- Total download: ~1.6GB (checkpoint files only, not the 6GB 7z archives which include training data)
+- Stored locally at: `models/fiber/Dataset040_newHorizontals/` and `models/fiber/Dataset041_newVerticals/`
+
+**Older model (Dataset004, DEPRECATED):**
+- Original 3-class model (bg/hz/vt in single model), 6 training volumes, ~238MB
 - Available at: `dl.ash2txt.org/community-uploads/bruniss/old_models/Dataset004-3d_mask-hz-only/`
-- Newer models exist (Dataset040_newHorizontals, Dataset041_newVerticals) using ResidualEncoderUNet (~781MB each) — these are separate horizontal/vertical binary models with 41 training samples, but are too large for 8GB M2
+- Superseded by Dataset040/041 with more training data and better architecture
 
 **Programmatic inference** (from reading nnUNetv2 source):
 ```python
 from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
 import torch, numpy as np
 
-predictor = nnUNetPredictor(
-    tile_step_size=0.5,
-    use_gaussian=True,
-    use_mirroring=False,       # disable TTA to save memory on M2
-    perform_everything_on_device=False,  # forced False on non-CUDA
-    device=torch.device('mps'),          # Apple Silicon
-)
-predictor.initialize_from_trained_model_folder(
-    'path/to/Dataset004_fiber3/nnUNetTrainer__nnUNetPlans__3d_fullres',
-    use_folds=(0,), checkpoint_name='checkpoint_final.pth'
-)
-
-# Predict on a CT patch: shape (1, Z, Y, X), channels-first
-ct_patch = np.zeros((1, 64, 160, 224), dtype=np.float32)
-properties = {'spacing': [7.91, 7.91, 7.91]}
-seg, probs = predictor.predict_single_npy_array(
-    ct_patch, properties, save_or_return_probabilities=True
-)
-# seg: (64, 160, 224) with values {0, 1, 2}
-# probs: (3, 64, 160, 224) softmax probabilities per class
+# Two models: run sequentially to save memory
+for model_dir in [hz_model_dir, vt_model_dir]:
+    predictor = nnUNetPredictor(
+        tile_step_size=0.5,
+        use_gaussian=True,
+        use_mirroring=False,       # disable TTA to save memory on M2
+        perform_everything_on_device=False,  # forced False on non-CUDA
+        device=torch.device('mps'),          # Apple Silicon
+    )
+    predictor.initialize_from_trained_model_folder(
+        model_dir, use_folds=(0,), checkpoint_name='checkpoint_final.pth'
+    )
+    # Predict on a CT patch: shape (1, Z, Y, X), channels-first
+    ct_patch = np.zeros((1, 64, 64, 64), dtype=np.float32)
+    properties = {'spacing': [1.0, 1.0, 1.0]}
+    seg, probs = predictor.predict_single_npy_array(
+        ct_patch, properties, save_or_return_probabilities=True
+    )
+    # seg: (64, 64, 64) with values {0, 1}
+    # probs: (2, 64, 64, 64) softmax probabilities per class
+    del predictor  # free memory before loading next model
 ```
 
-- **Pro**: Highest accuracy — proven on this exact data, won $20K prize. Per-voxel classification, not noisy orientation estimates.
-- **Con**: Heavy dependencies (nnunetv2, PyTorch ~2GB install), 238MB model download, ~6-8GB memory for inference (tight on M2 8GB), slower (~minutes for a full segment)
+- **Pro**: Highest accuracy — community gold standard for fiber detection. Per-voxel binary classification.
+- **Con**: Heavy dependencies (nnunetv2, PyTorch), ~1.6GB model download, requires sequential model loading to fit in 8GB. Slower (~minutes for 300 samples).
 - **Dependencies**: `nnunetv2`, `torch` (with MPS support ≥1.12), model weights
-- **Compute**: ~1-5 min per segment depending on patch count
+- **Compute**: ~2-10 min per segment depending on sample count and hardware
 
 **Newer option — Villa multi-task 3D UNet**:
 Villa's `segmentation/models/multi-task-3d-unet/` has a more sophisticated ResEnc UNet with squeeze-and-excitation blocks that can jointly predict surfaces, fiber orientations, normals, and ink. However, this requires more infrastructure and there are no publicly available pre-trained weights specifically for fiber detection. Not recommended for initial integration.
@@ -203,14 +214,15 @@ The fiber_coherence metric instead compares the **smallest** eigenvector (fiber 
 
 **Apple M2, 8GB unified memory:**
 - Method A (structure tensor): No issue. 32³ patches × 500 vertices = trivial memory.
-- Method B (nnUNet): Tight but feasible with these settings:
+- Method B (nnUNet): Feasible with sequential model loading:
+  - Load hz model → run all patches → free model → load vt model → run all patches → free model
   - `use_mirroring=False` (disable test-time augmentation, halves memory)
   - `use_folds=(0,)` (single fold, not ensemble)
   - `perform_everything_on_device=False` (forced on MPS anyway)
-  - Batch nearby vertices into shared patches to minimize inference calls
-  - Original model (238MB) fits; newer models (781MB) do not
+  - Each model ~781MB in memory; only one loaded at a time
+  - MPS cache cleared between models with `torch.mps.empty_cache()`
 
-**Fallback**: If nnUNet inference fails due to memory, automatically fall back to Method A with a warning. The scoring algorithm is the same; only the input quality degrades.
+**Fallback**: If nnUNet inference fails due to memory or missing dependency, automatically fall back to Method A with a warning. The scoring algorithm is the same; only the input quality degrades.
 
 #### Pre-computed fiber predictions
 
@@ -220,8 +232,8 @@ For scrolls where bruniss or the community has already run fiber inference, pre-
 # Use pre-computed fiber predictions (fastest, no inference needed)
 mesh-qa score segment.obj --volume URL --fiber-predictions path/to/predictions.zarr
 
-# Use bruniss nnUNet model (highest accuracy, runs inference)
-mesh-qa score segment.obj --volume URL --fiber-model path/to/nnUNet_results/Dataset004_fiber3/
+# Use bruniss nnUNet models (highest accuracy, runs inference)
+mesh-qa score segment.obj --volume URL --fiber-model models/fiber/
 
 # No fiber model available (fall back to structure tensor)
 mesh-qa score segment.obj --volume URL

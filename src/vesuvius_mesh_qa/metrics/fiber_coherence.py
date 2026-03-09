@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import numpy as np
 import open3d as o3d
-from scipy import sparse
 
 from vesuvius_mesh_qa.metrics.base import MetricComputer, MetricResult
 from vesuvius_mesh_qa.volume import VolumeAccessor
@@ -198,21 +197,31 @@ def _compute_fiber_orientation_nnunet(
     model_path: str,
     half_size: int = 32,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Compute fiber orientation using bruniss nnUNet fiber segmentation model.
+    """Compute fiber orientation using bruniss nnUNet fiber segmentation models.
 
-    Uses nnUNetPredictor to classify CT patches as background (0),
-    horizontal fibers (1), or vertical fibers (2). This is the highest
-    accuracy method but requires nnunetv2 and PyTorch.
+    bruniss trained two separate binary segmentation models:
+    - Dataset040_newHorizontals: detects horizontal fibers (bg=0, fiber=1)
+    - Dataset041_newVerticals: detects vertical fibers (bg=0, fiber=1)
+
+    We run both models on each CT patch and combine:
+    - Neither detects fiber → class 0 (background)
+    - Only hz model detects → class 1 (horizontal)
+    - Only vt model detects → class 2 (vertical)
+    - Both detect → take higher-confidence prediction
+
+    model_path should point to the base directory containing both
+    Dataset040_newHorizontals/ and Dataset041_newVerticals/ subdirectories.
+    Each subdirectory contains the nnUNet trainer folder structure.
 
     Args:
         volume: CT volume accessor.
         vertices: (N, 3) vertex positions.
         sample_indices: Indices of vertices to sample.
-        model_path: Path to nnUNet model folder (contains fold_0/, etc.).
+        model_path: Path to base directory containing both model folders.
         half_size: Half-size of the CT patch for inference.
 
     Returns:
-        fiber_dirs: (M, 3) placeholder direction vectors (nnUNet gives classes, not directions).
+        fiber_dirs: (M, 3) placeholder direction vectors.
         fiber_class: (M,) integer array — 0=background, 1=horizontal, 2=vertical.
         confidence: (M,) float array — softmax probability of predicted class.
     """
@@ -225,13 +234,149 @@ def _compute_fiber_orientation_nnunet(
             "Install with: pip install nnunetv2 torch"
         )
 
+    import os
+
     n_samples = len(sample_indices)
     fiber_dirs = np.zeros((n_samples, 3), dtype=np.float64)
     fiber_class = np.zeros(n_samples, dtype=np.int32)
     confidence = np.zeros(n_samples, dtype=np.float64)
 
-    # Initialize predictor
+    # Find model directories
+    hz_model_dir = _find_nnunet_model_dir(model_path, "Dataset040")
+    vt_model_dir = _find_nnunet_model_dir(model_path, "Dataset041")
+
+    if hz_model_dir is None and vt_model_dir is None:
+        raise FileNotFoundError(
+            f"No nnUNet model directories found in {model_path}. "
+            "Expected Dataset040_newHorizontals/ and/or Dataset041_newVerticals/ "
+            "subdirectories with nnUNet trainer folders."
+        )
+
     device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
+
+    # Extract all patches first (shared between both models)
+    patches = []
+    patch_valid = []
+    for i, vi in enumerate(sample_indices):
+        vertex = vertices[vi]
+        if not volume.vertex_in_bounds(vertex, margin=half_size):
+            patches.append(None)
+            patch_valid.append(False)
+            continue
+        chunk = volume.sample_neighborhood(vertex, half_size=half_size)
+        if chunk.size == 0 or chunk.max() == 0:
+            # Skip empty patches (outside scan or in masked region)
+            patches.append(None)
+            patch_valid.append(False)
+            continue
+        patches.append(chunk)
+        patch_valid.append(True)
+
+    # Run horizontal model on all patches
+    hz_classes = np.zeros(n_samples, dtype=np.int32)
+    hz_probs = np.zeros(n_samples, dtype=np.float64)
+
+    if hz_model_dir is not None:
+        hz_predictor = _make_nnunet_predictor(hz_model_dir, device)
+        for i in range(n_samples):
+            if not patch_valid[i]:
+                continue
+            cls, prob = _predict_center_class(hz_predictor, patches[i])
+            hz_classes[i] = cls
+            hz_probs[i] = prob
+        del hz_predictor
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        import gc
+        gc.collect()
+
+    # Run vertical model on all patches
+    vt_classes = np.zeros(n_samples, dtype=np.int32)
+    vt_probs = np.zeros(n_samples, dtype=np.float64)
+
+    if vt_model_dir is not None:
+        vt_predictor = _make_nnunet_predictor(vt_model_dir, device)
+        for i in range(n_samples):
+            if not patch_valid[i]:
+                continue
+            cls, prob = _predict_center_class(vt_predictor, patches[i])
+            vt_classes[i] = cls
+            vt_probs[i] = prob
+        del vt_predictor
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        import gc
+        gc.collect()
+
+    # Combine: hz fiber=1 → class 1, vt fiber=1 → class 2
+    for i in range(n_samples):
+        if not patch_valid[i]:
+            continue
+
+        hz_is_fiber = hz_classes[i] == 1
+        vt_is_fiber = vt_classes[i] == 1
+
+        if hz_is_fiber and vt_is_fiber:
+            # Both detected — take higher confidence
+            if hz_probs[i] >= vt_probs[i]:
+                fiber_class[i] = 1  # horizontal
+                confidence[i] = hz_probs[i]
+            else:
+                fiber_class[i] = 2  # vertical
+                confidence[i] = vt_probs[i]
+        elif hz_is_fiber:
+            fiber_class[i] = 1
+            confidence[i] = hz_probs[i]
+        elif vt_is_fiber:
+            fiber_class[i] = 2
+            confidence[i] = vt_probs[i]
+        else:
+            fiber_class[i] = 0  # background
+            confidence[i] = max(hz_probs[i], vt_probs[i])
+
+        # Set direction based on class
+        if fiber_class[i] == 1:
+            fiber_dirs[i] = [1.0, 0.0, 0.0]
+        elif fiber_class[i] == 2:
+            fiber_dirs[i] = [0.0, 0.0, 1.0]
+
+    return fiber_dirs, fiber_class, confidence
+
+
+def _find_nnunet_model_dir(base_path: str, dataset_prefix: str) -> str | None:
+    """Find the nnUNet trainer directory for a dataset within base_path.
+
+    Searches for directories matching the dataset prefix (e.g., "Dataset040")
+    and returns the path to the trainer subdirectory containing fold_0/.
+    """
+    import os
+
+    for entry in os.listdir(base_path):
+        if entry.startswith(dataset_prefix):
+            dataset_dir = os.path.join(base_path, entry)
+            if not os.path.isdir(dataset_dir):
+                continue
+            # Find the trainer subdirectory (prefer 16G over 40G for memory)
+            trainer_dirs = []
+            for sub in os.listdir(dataset_dir):
+                sub_path = os.path.join(dataset_dir, sub)
+                fold_path = os.path.join(sub_path, "fold_0")
+                if os.path.isdir(sub_path) and os.path.isdir(fold_path):
+                    trainer_dirs.append(sub_path)
+            # Prefer 16G variant for lower memory usage
+            for td in trainer_dirs:
+                if "16G" in td and "SkeletonRecall" not in td:
+                    return td
+            # Fall back to any available
+            if trainer_dirs:
+                return trainer_dirs[0]
+    return None
+
+
+def _make_nnunet_predictor(model_dir: str, device):
+    """Create and initialize an nnUNetPredictor from a model directory."""
+    from nnunetv2.inference.predict_from_raw_data import nnUNetPredictor
+
     predictor = nnUNetPredictor(
         tile_step_size=0.5,
         use_gaussian=True,
@@ -240,43 +385,28 @@ def _compute_fiber_orientation_nnunet(
         device=device,
     )
     predictor.initialize_from_trained_model_folder(
-        model_path,
+        model_dir,
         use_folds=(0,),
         checkpoint_name="checkpoint_final.pth",
     )
+    return predictor
 
-    for i, vi in enumerate(sample_indices):
-        vertex = vertices[vi]
-        if not volume.vertex_in_bounds(vertex, margin=half_size):
-            continue
 
-        chunk = volume.sample_neighborhood(vertex, half_size=half_size)
-        if chunk.size == 0:
-            continue
+def _predict_center_class(
+    predictor, chunk: np.ndarray
+) -> tuple[int, float]:
+    """Run nnUNet prediction on a chunk and return center voxel class + probability."""
+    patch = chunk.astype(np.float32)[np.newaxis, ...]  # (1, Z, Y, X)
+    properties = {"spacing": [1.0, 1.0, 1.0]}
 
-        # nnUNet expects (C, Z, Y, X) float32
-        patch = chunk.astype(np.float32)[np.newaxis, ...]  # (1, Z, Y, X)
-        properties = {"spacing": [volume.voxel_size_um] * 3 if hasattr(volume, "voxel_size_um") else [7.91] * 3}
+    seg, probs = predictor.predict_single_npy_array(
+        patch, properties, save_or_return_probabilities=True,
+    )
 
-        seg, probs = predictor.predict_single_npy_array(
-            patch, properties, save_or_return_probabilities=True,
-        )
-
-        # Get center voxel classification
-        cz, cy, cx = seg.shape[0] // 2, seg.shape[1] // 2, seg.shape[2] // 2
-        center_class = int(seg[cz, cy, cx])
-        center_prob = float(probs[center_class, cz, cy, cx]) if probs is not None else 1.0
-
-        fiber_class[i] = center_class
-        confidence[i] = center_prob
-
-        # Set approximate direction based on class
-        if center_class == 1:  # horizontal
-            fiber_dirs[i] = [1.0, 0.0, 0.0]
-        elif center_class == 2:  # vertical
-            fiber_dirs[i] = [0.0, 0.0, 1.0]
-
-    return fiber_dirs, fiber_class, confidence
+    cz, cy, cx = seg.shape[0] // 2, seg.shape[1] // 2, seg.shape[2] // 2
+    center_class = int(seg[cz, cy, cx])
+    center_prob = float(probs[center_class, cz, cy, cx]) if probs is not None else 1.0
+    return center_class, center_prob
 
 
 def _compute_fiber_orientation_predictions(
@@ -342,22 +472,6 @@ def _compute_fiber_orientation_predictions(
     return fiber_dirs, fiber_class, confidence
 
 
-def _build_vertex_adjacency_sparse(
-    triangles: np.ndarray, n_vertices: int
-) -> sparse.csr_matrix:
-    """Build sparse vertex adjacency matrix from triangles."""
-    edges_a = np.column_stack([triangles[:, 0], triangles[:, 1]])
-    edges_b = np.column_stack([triangles[:, 1], triangles[:, 2]])
-    edges_c = np.column_stack([triangles[:, 2], triangles[:, 0]])
-    all_edges = np.vstack([edges_a, edges_b, edges_c])
-
-    rows = np.concatenate([all_edges[:, 0], all_edges[:, 1]])
-    cols = np.concatenate([all_edges[:, 1], all_edges[:, 0]])
-    data = np.ones(len(rows), dtype=np.float32)
-    adj = sparse.csr_matrix((data, (rows, cols)), shape=(n_vertices, n_vertices))
-    return adj
-
-
 class FiberCoherenceMetric(MetricComputer):
     """Detect sheet switches via fiber orientation discontinuities.
 
@@ -417,19 +531,45 @@ class FiberCoherenceMetric(MetricComputer):
             )
 
         rng = np.random.default_rng(42)
-        if len(valid_indices) > self._n_samples:
-            sample_indices = rng.choice(valid_indices, self._n_samples, replace=False)
+        # When using nnUNet, limit samples since inference is slow (~12s/patch on MPS)
+        n_samples = self._n_samples
+        if self._fiber_model_path and n_samples > 50:
+            n_samples = 50
+
+        # Oversample 3x and spot-check for non-zero CT data.
+        # Masked volumes have large empty regions where in-bounds vertices
+        # map to all-zero data — we skip these upfront.
+        oversample = min(n_samples * 3, len(valid_indices))
+        if len(valid_indices) > oversample:
+            candidate_indices = rng.choice(valid_indices, oversample, replace=False)
         else:
-            sample_indices = valid_indices
+            candidate_indices = valid_indices.copy()
+
+        # Filter to vertices with actual CT data (non-zero patches)
+        live_indices = []
+        for vi in candidate_indices:
+            patch = self._volume.sample_neighborhood(vertices[vi], half_size=4)
+            if patch.max() > 0:
+                live_indices.append(vi)
+            if len(live_indices) >= n_samples:
+                break
+        sample_indices = np.array(live_indices, dtype=np.intp) if live_indices else candidate_indices[:n_samples]
 
         # Compute fiber orientation using best available method:
         # 1. Pre-computed predictions (fastest, highest quality)
         # 2. nnUNet model (high accuracy, requires torch)
         # 3. Structure tensor (lightweight default)
         method = "structure_tensor"
+        # confidence_threshold: minimum confidence to include a vertex in comparison.
+        # For nnUNet/predictions: softmax probability (0-1), threshold at 0.5.
+        # For structure tensor: eigenvalue anisotropy ratio — real papyrus CT
+        # has anisotropy very close to 1.0, so we use 0.0 (no filtering).
+        # Non-zero patch filtering already excludes empty regions.
+        confidence_threshold = 0.0  # default for structure tensor (no filtering)
         if self._fiber_predictions_url:
             method = "predictions"
-            fiber_dirs, fiber_class, anisotropy = (
+            confidence_threshold = 0.5
+            fiber_dirs, fiber_class, confidence = (
                 _compute_fiber_orientation_predictions(
                     self._volume, vertices, sample_indices,
                     self._fiber_predictions_url,
@@ -438,7 +578,8 @@ class FiberCoherenceMetric(MetricComputer):
         elif self._fiber_model_path:
             try:
                 method = "nnunet"
-                fiber_dirs, fiber_class, anisotropy = (
+                confidence_threshold = 0.5
+                fiber_dirs, fiber_class, confidence = (
                     _compute_fiber_orientation_nnunet(
                         self._volume, vertices, sample_indices,
                         self._fiber_model_path,
@@ -447,87 +588,82 @@ class FiberCoherenceMetric(MetricComputer):
                 )
             except ImportError:
                 method = "structure_tensor (nnunet unavailable)"
-                fiber_dirs, fiber_class, anisotropy = (
+                fiber_dirs, fiber_class, confidence = (
                     _compute_fiber_orientation_structure_tensor(
                         self._volume, vertices, sample_indices,
                         half_size=self._half_size,
                     )
                 )
         else:
-            fiber_dirs, fiber_class, anisotropy = (
+            fiber_dirs, fiber_class, confidence = (
                 _compute_fiber_orientation_structure_tensor(
                     self._volume, vertices, sample_indices,
                     half_size=self._half_size,
                 )
             )
 
-        # Build neighborhood for comparison
-        # Use multi-ring adjacency for wider spatial context
-        adj = _build_vertex_adjacency_sparse(triangles, n_vertices)
-        adj_k = adj
-        for _ in range(self._n_rings - 1):
-            adj_k = adj_k.dot(adj)
-            adj_k.data[:] = 1.0
+        # Compare each sample to its K nearest sampled neighbors in 3D space.
+        # This is more robust than mesh adjacency for sparse sampling on large meshes.
+        from scipy.spatial import KDTree
 
-        # For each sampled vertex, compare fiber features to neighbors
-        sample_idx_map = {int(v): i for i, v in enumerate(sample_indices)}
+        # Build KD-tree from sampled vertex positions
+        sample_positions = vertices[sample_indices]
+        # Filter to valid (classified) samples for comparison
+        valid_mask = (fiber_class > 0)
+        for i in range(len(sample_indices)):
+            if confidence[i] < confidence_threshold:
+                valid_mask[i] = False
+
+        valid_sample_idx = np.where(valid_mask)[0]
 
         n_compared = 0
         n_class_flips = 0
         n_direction_discontinuities = 0
         flip_vertices: list[int] = []
 
-        for i, vi in enumerate(sample_indices):
-            if fiber_class[i] == 0:  # invalid
-                continue
-            if anisotropy[i] < 2.0:  # low confidence — skip
-                continue
+        if len(valid_sample_idx) >= 2:
+            valid_positions = sample_positions[valid_sample_idx]
+            tree = KDTree(valid_positions)
+            k_neighbors = min(6, len(valid_sample_idx) - 1)
 
-            # Get neighbors that are also sampled
-            row_start = adj_k.indptr[vi]
-            row_end = adj_k.indptr[vi + 1]
-            neighbor_verts = adj_k.indices[row_start:row_end]
+            for local_i, global_i in enumerate(valid_sample_idx):
+                vi = int(sample_indices[global_i])
+                pos = valid_positions[local_i]
+                # Query k+1 nearest (includes self)
+                dists, nn_idx = tree.query(pos, k=k_neighbors + 1)
+                # Exclude self
+                neighbor_local = [j for j in nn_idx if j != local_i][:k_neighbors]
+                neighbor_global = [valid_sample_idx[j] for j in neighbor_local]
 
-            neighbor_samples = [
-                sample_idx_map[int(nv)]
-                for nv in neighbor_verts
-                if int(nv) in sample_idx_map and int(nv) != vi
-            ]
+                if not neighbor_global:
+                    continue
 
-            if not neighbor_samples:
-                continue
+                # Compare fiber class
+                my_class = fiber_class[global_i]
+                neighbor_classes = fiber_class[neighbor_global]
 
-            # Compare fiber class
-            my_class = fiber_class[i]
-            neighbor_classes = fiber_class[neighbor_samples]
-            valid_neighbors = neighbor_classes > 0
-            if not np.any(valid_neighbors):
-                continue
+                n_compared += 1
 
-            n_compared += 1
-            neighbor_valid_classes = neighbor_classes[valid_neighbors]
+                # Class flip: majority of neighbors have different class
+                n_same = int(np.sum(neighbor_classes == my_class))
+                n_diff = int(np.sum(neighbor_classes != my_class))
+                if n_diff > n_same:
+                    n_class_flips += 1
+                    flip_vertices.append(vi)
 
-            # Class flip: majority of neighbors have different class
-            n_same = np.sum(neighbor_valid_classes == my_class)
-            n_diff = np.sum(neighbor_valid_classes != my_class)
-            if n_diff > n_same:
-                n_class_flips += 1
-                flip_vertices.append(int(vi))
-
-            # Direction discontinuity: fiber direction differs significantly
-            my_dir = fiber_dirs[i]
-            neighbor_dirs = fiber_dirs[neighbor_samples]
-            valid_dir_mask = np.linalg.norm(neighbor_dirs, axis=1) > 0.5
-            if np.any(valid_dir_mask):
-                valid_ndirs = neighbor_dirs[valid_dir_mask]
-                # Use absolute dot product (fiber direction is ambiguous ±)
-                dots = np.abs(np.sum(my_dir * valid_ndirs, axis=1))
-                dots = np.clip(dots, 0.0, 1.0)
-                mean_alignment = float(np.mean(dots))
-                if mean_alignment < 0.5:  # >60° average misalignment
-                    n_direction_discontinuities += 1
-                    if int(vi) not in flip_vertices:
-                        flip_vertices.append(int(vi))
+                # Direction discontinuity: fiber direction differs significantly
+                my_dir = fiber_dirs[global_i]
+                neighbor_dirs = fiber_dirs[neighbor_global]
+                valid_dir_mask = np.linalg.norm(neighbor_dirs, axis=1) > 0.5
+                if np.any(valid_dir_mask):
+                    valid_ndirs = neighbor_dirs[valid_dir_mask]
+                    dots = np.abs(np.sum(my_dir * valid_ndirs, axis=1))
+                    dots = np.clip(dots, 0.0, 1.0)
+                    mean_alignment = float(np.mean(dots))
+                    if mean_alignment < 0.5:  # >60° average misalignment
+                        n_direction_discontinuities += 1
+                        if vi not in flip_vertices:
+                            flip_vertices.append(vi)
 
         # Score
         if n_compared == 0:
@@ -536,8 +672,10 @@ class FiberCoherenceMetric(MetricComputer):
         else:
             total_flags = n_class_flips + n_direction_discontinuities
             flip_fraction = total_flags / n_compared
-            # Linear mapping: 0% flagged = 1.0, 10% flagged = 0.0
-            score = float(np.clip(1.0 - flip_fraction / 0.10, 0.0, 1.0))
+            # Linear mapping: 0% flagged = 1.0, 25% flagged = 0.0
+            # Structure tensor classification is noisy (~5-10% baseline error),
+            # so we use a wider threshold. Real sheet switches cause 30%+ flips.
+            score = float(np.clip(1.0 - flip_fraction / 0.25, 0.0, 1.0))
 
         # Map flip vertices to faces
         problem_faces = []
@@ -558,7 +696,7 @@ class FiberCoherenceMetric(MetricComputer):
                 "n_class_flips": n_class_flips,
                 "n_direction_discontinuities": n_direction_discontinuities,
                 "flip_fraction": flip_fraction,
-                "mean_anisotropy": float(np.mean(anisotropy[anisotropy > 0])) if np.any(anisotropy > 0) else 0.0,
+                "mean_confidence": float(np.mean(confidence[confidence > 0])) if np.any(confidence > 0) else 0.0,
                 "sample_indices": sample_indices,
                 "fiber_class": fiber_class,
             },

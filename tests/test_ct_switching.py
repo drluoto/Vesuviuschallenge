@@ -68,6 +68,8 @@ class TestCTSheetSwitchingMetric:
         accessor.sample_neighborhood.return_value = np.zeros(
             (32, 32, 32), dtype=np.float32
         )
+        # sort_by_chunk should return the indices unchanged
+        accessor.sort_by_chunk.side_effect = lambda verts, indices: indices
         return accessor
 
     def test_well_aligned_mesh_scores_high(self, monkeypatch):
@@ -94,7 +96,7 @@ class TestCTSheetSwitchingMetric:
             mock_compute_ct_normal,
         )
 
-        metric = CTSheetSwitchingMetric(accessor, n_samples=n)
+        metric = CTSheetSwitchingMetric(accessor)
         result = metric.compute(mesh)
 
         assert result.score > 0.9
@@ -121,7 +123,7 @@ class TestCTSheetSwitchingMetric:
             mock_compute_ct_normal,
         )
 
-        metric = CTSheetSwitchingMetric(accessor, n_samples=n)
+        metric = CTSheetSwitchingMetric(accessor)
         result = metric.compute(mesh)
 
         assert result.score < 0.2

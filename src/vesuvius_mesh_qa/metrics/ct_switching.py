@@ -44,7 +44,16 @@ class CTSheetSwitchingMetric(MetricComputer):
         self._sigma = sigma
 
     def compute(self, mesh: o3d.geometry.TriangleMesh) -> MetricResult:
-        """Compute sheet switching score by sampling mesh vertices."""
+        """Compute CT alignment score by sampling mesh vertices.
+
+        This metric provides a statistical signal (score) comparing mesh
+        normals to CT structure tensor normals. Useful as a global quality
+        indicator but NOT for spatial detection — the structure tensor is
+        too noisy (~25-30° baseline) for reliable per-vertex flagging.
+
+        For spatial sheet-switch detection, use fiber_coherence and
+        winding_angle metrics instead (community-validated approaches).
+        """
         vertices = np.asarray(mesh.vertices)
         normals = np.asarray(mesh.vertex_normals)
 
@@ -67,12 +76,11 @@ class CTSheetSwitchingMetric(MetricComputer):
                 },
             )
 
-        # Sample up to n_samples random vertices
+        # Sample random vertices, sorted by chunk for cache efficiency
         rng = np.random.default_rng(42)
         if len(valid_indices) > self._n_samples:
-            sample_indices = rng.choice(valid_indices, self._n_samples, replace=False)
-        else:
-            sample_indices = valid_indices
+            valid_indices = rng.choice(valid_indices, self._n_samples, replace=False)
+        sample_indices = self._volume.sort_by_chunk(vertices, valid_indices)
 
         angles = np.zeros(len(sample_indices))
         problem_vertices: list[int] = []
@@ -110,14 +118,16 @@ class CTSheetSwitchingMetric(MetricComputer):
 
         fraction_severe = float(np.sum(angles > _SEVERE_ANGLE_DEG) / len(angles))
 
-        # Convert problem vertices to problem faces for visualization
+        # Convert problem vertices to problem faces (vectorized)
         problem_face_indices: list[int] = []
         if problem_vertices:
             triangles = np.asarray(mesh.triangles)
             problem_set = set(problem_vertices)
-            for fi, tri in enumerate(triangles):
-                if tri[0] in problem_set or tri[1] in problem_set or tri[2] in problem_set:
-                    problem_face_indices.append(fi)
+            mask = np.array([
+                tri[0] in problem_set or tri[1] in problem_set or tri[2] in problem_set
+                for tri in triangles
+            ])
+            problem_face_indices = np.where(mask)[0].tolist()
 
         return MetricResult(
             name=self.name,
@@ -129,7 +139,7 @@ class CTSheetSwitchingMetric(MetricComputer):
                 "median_angle_deg": float(np.median(angles)) if len(angles) > 0 else 0.0,
                 "fraction_severe": fraction_severe,
             },
-            problem_faces=np.array(problem_face_indices) if problem_face_indices else None,
+            problem_faces=np.array(problem_face_indices, dtype=np.int64) if problem_face_indices else None,
         )
 
     @staticmethod
