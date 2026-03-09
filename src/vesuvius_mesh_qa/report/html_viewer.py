@@ -145,9 +145,13 @@ def _build_vertex_colors_fiber(
     """Build per-vertex colors from fiber coherence class data.
 
     Colors: horizontal fibers = blue, vertical = red, unsampled = gray.
+    Each unsampled vertex is colored by its nearest classified sample
+    using a KD-tree, so the visualization covers the entire mesh.
     Vertices where class flips occur get highlighted in yellow.
     Returns None if no fiber_coherence result with class data is found.
     """
+    from scipy.spatial import KDTree
+
     fiber_result = None
     for r in results:
         if r.name == "fiber_coherence" and "fiber_class" in r.details:
@@ -156,20 +160,48 @@ def _build_vertex_colors_fiber(
     if fiber_result is None:
         return None
 
-    n_verts = len(mesh.vertices)
+    vertices = np.asarray(mesh.vertices)
+    n_verts = len(vertices)
     colors = np.full((n_verts, 3), 128, dtype=np.uint8)  # gray default
 
     sample_indices = fiber_result.details["sample_indices"]
-    fiber_class = fiber_result.details["fiber_class"]
+    fiber_class = np.asarray(fiber_result.details["fiber_class"])
 
-    for i, vi in enumerate(sample_indices):
-        if vi >= n_verts:
-            continue
-        cls = fiber_class[i]
-        if cls == 1:  # horizontal = blue
-            colors[vi] = [50, 100, 220]
-        elif cls == 2:  # vertical = red
-            colors[vi] = [220, 50, 50]
+    # Build map of classified sample positions
+    classified_mask = fiber_class > 0
+    classified_local = np.where(classified_mask)[0]
+
+    if len(classified_local) >= 2:
+        # Spread color: assign every vertex the class of its nearest
+        # classified sample using a KD-tree
+        classified_vertex_ids = np.array([
+            sample_indices[i] for i in classified_local
+            if sample_indices[i] < n_verts
+        ])
+        classified_classes = np.array([
+            fiber_class[i] for i in classified_local
+            if sample_indices[i] < n_verts
+        ])
+        classified_positions = vertices[classified_vertex_ids]
+        tree = KDTree(classified_positions)
+        _, nn_idx = tree.query(vertices)
+        nearest_class = classified_classes[nn_idx]
+
+        # Color by nearest class
+        hz_mask = nearest_class == 1
+        vt_mask = nearest_class == 2
+        colors[hz_mask] = [50, 100, 220]   # horizontal = blue
+        colors[vt_mask] = [220, 50, 50]    # vertical = red
+    else:
+        # Too few samples to spread — color only sampled vertices
+        for i, vi in enumerate(sample_indices):
+            if vi >= n_verts:
+                continue
+            cls = fiber_class[i]
+            if cls == 1:
+                colors[vi] = [50, 100, 220]
+            elif cls == 2:
+                colors[vi] = [220, 50, 50]
 
     # Highlight problem faces (class flips) in yellow
     if fiber_result.problem_faces is not None:
@@ -178,6 +210,97 @@ def _build_vertex_colors_fiber(
             if fi < len(triangles):
                 for vi in triangles[fi]:
                     colors[vi] = [255, 220, 50]
+
+    return colors
+
+
+def _build_vertex_colors_ct_texture(
+    mesh: o3d.geometry.TriangleMesh,
+    volume_url: str,
+) -> np.ndarray | None:
+    """Build per-vertex grayscale colors from CT volume intensity.
+
+    Samples the CT intensity at each vertex position using batch chunk
+    reads for efficiency. Maps to warm papyrus-like color tones.
+    Returns None if volume is unavailable or has no data at mesh positions.
+    """
+    from collections import defaultdict
+    from vesuvius_mesh_qa.volume import VolumeAccessor
+
+    try:
+        # Use scale=2 (quarter-resolution) for faster remote reads.
+        # Visual quality is still good — each voxel covers 4x4x4 original voxels.
+        vol = VolumeAccessor(volume_url, scale=2, cache_chunks=2048)
+    except Exception:
+        return None
+
+    vertices = np.asarray(mesh.vertices)
+    n_verts = len(vertices)
+    intensities = np.zeros(n_verts, dtype=np.float32)
+    shape = vol._shape  # (Z, Y, X)
+    chunks = vol._chunks  # (cz, cy, cx)
+    scale = vol._scale_factor
+
+    # Convert all vertices to volume indices at once
+    voxels_x = np.round(vertices[:, 0] / scale).astype(np.int64)
+    voxels_y = np.round(vertices[:, 1] / scale).astype(np.int64)
+    voxels_z = np.round(vertices[:, 2] / scale).astype(np.int64)
+
+    # Filter to in-bounds vertices
+    in_bounds = (
+        (voxels_z >= 0) & (voxels_z < shape[0]) &
+        (voxels_y >= 0) & (voxels_y < shape[1]) &
+        (voxels_x >= 0) & (voxels_x < shape[2])
+    )
+
+    # Group in-bounds vertices by chunk key for batch reads
+    chunk_groups = defaultdict(list)
+    for i in np.where(in_bounds)[0]:
+        cz = int(voxels_z[i] // chunks[0])
+        cy = int(voxels_y[i] // chunks[1])
+        cx = int(voxels_x[i] // chunks[2])
+        chunk_groups[(cz, cy, cx)].append(i)
+
+    # Batch-read each chunk and extract all vertex values at once
+    n_valid = 0
+    for (cz, cy, cx), vert_indices in chunk_groups.items():
+        try:
+            chunk_data = vol._fetch_chunk(cz, cy, cx)
+        except Exception:
+            continue
+        gz0, gy0, gx0 = cz * chunks[0], cy * chunks[1], cx * chunks[2]
+        for i in vert_indices:
+            lz = int(voxels_z[i]) - gz0
+            ly = int(voxels_y[i]) - gy0
+            lx = int(voxels_x[i]) - gx0
+            if 0 <= lz < chunk_data.shape[0] and 0 <= ly < chunk_data.shape[1] and 0 <= lx < chunk_data.shape[2]:
+                val = float(chunk_data[lz, ly, lx])
+                intensities[i] = val
+                if val > 0:
+                    n_valid += 1
+
+    if n_valid < 10:
+        return None
+
+    # Normalize to 0-1 range using non-zero percentiles
+    nonzero = intensities[intensities > 0]
+    if len(nonzero) < 10:
+        return None
+    p2, p98 = np.percentile(nonzero, [2, 98])
+    if p98 <= p2:
+        return None
+    norm = np.clip((intensities - p2) / (p98 - p2), 0.0, 1.0)
+
+    # Map to warm papyrus tones: dark brown -> tan -> cream
+    colors = np.zeros((n_verts, 3), dtype=np.uint8)
+    # Masked/zero regions -> dark background
+    zero_mask = intensities == 0
+    colors[zero_mask] = [30, 25, 20]
+    # Non-zero: warm grayscale
+    nz = ~zero_mask
+    colors[nz, 0] = (40 + norm[nz] * 195).astype(np.uint8)  # R: 40-235
+    colors[nz, 1] = (30 + norm[nz] * 175).astype(np.uint8)  # G: 30-205
+    colors[nz, 2] = (20 + norm[nz] * 145).astype(np.uint8)  # B: 20-165
 
     return colors
 
@@ -596,6 +719,7 @@ const colMetricB64 = "%(colors_metric_b64)s";
 const colHeatmapB64 = "%(colors_heatmap_b64)s";
 const colWindingB64 = "%(colors_winding_b64)s";
 const colFiberB64 = "%(colors_fiber_b64)s";
+const colCtB64 = "%(colors_ct_b64)s";
 const clusters = %(clusters_json)s;
 
 function b64ToFloat32(b64) {
@@ -623,12 +747,14 @@ const colMetricRaw = b64ToUint8(colMetricB64);
 const colHeatmapRaw = b64ToUint8(colHeatmapB64);
 const colWindingRaw = colWindingB64 ? b64ToUint8(colWindingB64) : null;
 const colFiberRaw = colFiberB64 ? b64ToUint8(colFiberB64) : null;
+const colCtRaw = colCtB64 ? b64ToUint8(colCtB64) : null;
 
 // Pre-convert color sets to float
 const colMetric = new Float32Array(colMetricRaw.length);
 const colHeatmap = new Float32Array(colHeatmapRaw.length);
 const colWinding = colWindingRaw ? new Float32Array(colWindingRaw.length) : null;
 const colFiber = colFiberRaw ? new Float32Array(colFiberRaw.length) : null;
+const colCt = colCtRaw ? new Float32Array(colCtRaw.length) : null;
 for (let i = 0; i < colMetricRaw.length; i++) {
   colMetric[i] = colMetricRaw[i] / 255.0;
   colHeatmap[i] = colHeatmapRaw[i] / 255.0;
@@ -638,6 +764,9 @@ if (colWindingRaw) {
 }
 if (colFiberRaw) {
   for (let i = 0; i < colFiberRaw.length; i++) colFiber[i] = colFiberRaw[i] / 255.0;
+}
+if (colCtRaw) {
+  for (let i = 0; i < colCtRaw.length; i++) colCt[i] = colCtRaw[i] / 255.0;
 }
 
 // Setup
@@ -710,6 +839,7 @@ window.setViewMode = function(mode) {
   if (mode === 'heatmap') src = colHeatmap;
   else if (mode === 'winding' && colWinding) src = colWinding;
   else if (mode === 'fiber' && colFiber) src = colFiber;
+  else if (mode === 'ct' && colCt) src = colCt;
   const arr = colorAttr.array;
   for (let i = 0; i < arr.length; i++) arr[i] = src[i];
   colorAttr.needsUpdate = true;
@@ -828,12 +958,14 @@ def export_html_review(
     output_path: Path,
     title: str = "Segment",
     umbilicus: str | tuple[float, float] | np.ndarray | None = None,
+    volume_url: str | None = None,
 ) -> None:
     """Export an interactive HTML review page for the mesh.
 
     Args:
         umbilicus: Optional umbilicus data for winding angle rainbow view.
             Can be a file path, (x, z) tuple, or numpy array.
+        volume_url: Optional Zarr URL for CT texture view mode.
     """
     n_faces_orig = len(mesh.triangles)
 
@@ -855,6 +987,9 @@ def export_html_review(
 
     # Build fiber class colors (from metric results, no volume access needed)
     colors_fiber_orig = _build_vertex_colors_fiber(mesh, results)
+
+    # CT texture is built on the decimated mesh (faster for remote volumes)
+    # We defer it to after decimation below.
 
     # Decimate for viewer
     view_mesh, ratio = _decimate_if_needed(mesh)
@@ -888,6 +1023,11 @@ def export_html_review(
             colors_winding = None
         colors_fiber = colors_fiber_orig  # Same mesh, no remapping needed
 
+    # Build CT texture on the decimated mesh directly (much fewer vertices)
+    colors_ct = None
+    if volume_url:
+        colors_ct = _build_vertex_colors_ct_texture(view_mesh, volume_url)
+
     vertices = np.asarray(view_mesh.vertices).astype(np.float32)
     triangles = np.asarray(view_mesh.triangles).astype(np.uint32)
 
@@ -897,6 +1037,7 @@ def export_html_review(
     colors_heatmap_b64 = _encode_array(colors_heatmap.astype(np.uint8).ravel())
     colors_winding_b64 = _encode_array(colors_winding.astype(np.uint8).ravel()) if colors_winding is not None else ""
     colors_fiber_b64 = _encode_array(colors_fiber.astype(np.uint8).ravel()) if colors_fiber is not None else ""
+    colors_ct_b64 = _encode_array(colors_ct.astype(np.uint8).ravel()) if colors_ct is not None else ""
 
     clusters_json = json.dumps(clusters)
 
@@ -955,6 +1096,8 @@ def export_html_review(
         '<button class="toggle-btn active" id="btn-metric" onclick="setViewMode(\'metric\')">Metric Colors</button>'
         '<button class="toggle-btn" id="btn-heatmap" onclick="setViewMode(\'heatmap\')">Deviation Heatmap</button>'
     )
+    if colors_ct is not None:
+        view_buttons += '<button class="toggle-btn" id="btn-ct" onclick="setViewMode(\'ct\')">CT Texture</button>'
     if colors_fiber is not None:
         view_buttons += '<button class="toggle-btn" id="btn-fiber" onclick="setViewMode(\'fiber\')">Fiber Classes</button>'
     if colors_winding is not None:
@@ -975,6 +1118,7 @@ def export_html_review(
         "colors_heatmap_b64": colors_heatmap_b64,
         "colors_winding_b64": colors_winding_b64,
         "colors_fiber_b64": colors_fiber_b64,
+        "colors_ct_b64": colors_ct_b64,
         "clusters_json": clusters_json,
         "view_buttons": view_buttons,
     }

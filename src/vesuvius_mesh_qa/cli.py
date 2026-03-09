@@ -127,7 +127,7 @@ def score(path: str, fmt: str, weights: str | None, visualize: str | None, revie
 
     if review:
         review_path = Path(review)
-        export_html_review(mesh, results, agg, grade, review_path, title=mesh_path.stem, umbilicus=umb_arg)
+        export_html_review(mesh, results, agg, grade, review_path, title=mesh_path.stem, umbilicus=umb_arg, volume_url=volume)
         console.print(f"  Review page saved to [bold]{review_path}[/bold]")
 
     if fmt == "json":
