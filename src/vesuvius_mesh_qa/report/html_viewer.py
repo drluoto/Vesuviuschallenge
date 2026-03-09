@@ -218,16 +218,12 @@ def _build_vertex_colors_ct_texture(
     mesh: o3d.geometry.TriangleMesh,
     volume_url: str,
 ) -> np.ndarray | None:
-    """Build per-vertex colors from CT volume at high resolution.
+    """Build per-vertex colors from CT volume.
 
-    Uses scale=1 (half-resolution, ~15.8µm/voxel) on the original mesh
-    (not decimated) to capture fiber-level detail. Papyrus fibers are
-    100-200µm apart = 6-13 voxels at this scale. With ~548K vertices
-    and ~80µm triangle edges, each edge spans ~5 voxels — enough to
-    resolve individual fibers and layer boundaries.
-
-    Chunk reads are vectorized: vertices grouped by chunk key, all values
-    extracted per chunk in one pass via numpy fancy indexing.
+    Uses scale=1 (~15.8µm/voxel) on the original mesh (not decimated).
+    Scale=0 gives the same visual result since the mesh vertex spacing
+    (~80µm) is the limiting factor for visible detail, not voxel size.
+    Scale=1 is 3× faster for the same output.
 
     Returns None if volume is unavailable or has no data at mesh positions.
     """
@@ -652,6 +648,10 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
               padding: 6px 12px; border-radius: 4px; cursor: pointer;
               font-size: 11px; margin: 4px 2px; }
 .toggle-btn.active { background: #1a4a7a; color: #fff; border-color: #4488bb; }
+.viewmode-info { background: #0a1a3a; border: 1px solid #1a3a6a; border-radius: 4px;
+                 padding: 8px 10px; margin-top: 6px; font-size: 11px; color: #8ab;
+                 line-height: 1.4; display: none; }
+.viewmode-info.visible { display: block; }
 .cluster-card { background: #0f3460; border-radius: 6px; padding: 10px;
                 margin-bottom: 8px; cursor: pointer; transition: all 0.2s;
                 border-left: 3px solid transparent; }
@@ -701,6 +701,7 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
     <div id="metrics">%(metrics_html)s</div>
     <h2>View Mode</h2>
     <div>%(view_buttons)s</div>
+    <div class="viewmode-info visible" id="viewmode-info"></div>
     <h2>Problem Clusters (%(n_clusters)s found)</h2>
     <div class="help-text">
       Click a cluster to zoom in. Tags show which detectors flagged each region:
@@ -898,7 +899,21 @@ window.setViewMode = function(mode) {
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
   const btn = document.getElementById('btn-' + mode);
   if (btn) btn.classList.add('active');
+  // Update info box
+  const descs = {
+    metric: 'Per-face quality coloring. Green = good, red = sheet switching, magenta = self-intersections, blue = noise, orange = poor triangle quality, yellow = normal inconsistency.',
+    heatmap: 'Normal deviation angle heatmap. Shows how much each face normal deviates from the 8-ring neighborhood average. Green = aligned (0deg), yellow = moderate (20deg), red = sharp deviation (40deg+). Highlights geometric anomalies and surface kinks.',
+    ct: 'CT volume intensity mapped onto the full-resolution mesh (not decimated). Shows actual papyrus structure from the micro-CT scan. Dark regions = masked/empty volume. Brightness = CT density. Visible texture depends on mesh vertex density and CT data coverage.',
+    fiber: 'Fiber orientation classes from structure tensor analysis of the CT volume. Blue = horizontal fibers, red = vertical fibers, yellow = class flip between neighbors (potential sheet switch). Gray = unclassified or no CT data.',
+    winding: 'Winding angle around the scroll umbilicus (center axis). Rainbow coloring shows angular position: faces at similar angles are same color. Sharp color transitions between adjacent faces indicate potential sheet switching where the surface jumps between wrapping layers.'
+  };
+  const info = document.getElementById('viewmode-info');
+  if (info && descs[mode]) { info.textContent = descs[mode]; info.classList.add('visible'); }
+  else if (info) { info.classList.remove('visible'); }
 };
+// Set initial info for default mode
+window.setViewMode('metric');
+document.getElementById('btn-metric').classList.add('active');
 
 // Draw cross-section chart on a canvas
 function drawCrossSection(canvasId, data) {
