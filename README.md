@@ -50,17 +50,23 @@ mesh-qa batch path/to/volpkg/paths/ -o rankings.csv
 
 ## Metrics
 
-| Metric | Weight | What it measures |
-|--------|--------|-----------------|
-| `triangle_quality` | 0.10 | Aspect ratios, minimum angles, area uniformity |
-| `topology` | 0.10 | Manifoldness, connected components, boundary edges |
-| `normal_consistency` | 0.15 | Smoothness of adjacent face normals |
-| `sheet_switching` | 0.30 | **Detects layer-jumping failures** (the key metric) |
-| `self_intersections` | 0.20 | Self-overlapping geometry (Moller triangle intersection) |
-| `noise` | 0.10 | Statistical outlier vertices (spikes) |
-| `ct_sheet_switching` | 0.10 | **CT-informed layer alignment** (experimental, requires `--volume`) |
+| Metric | Tier 1 | Tier 2 | What it measures |
+|--------|--------|--------|-----------------|
+| `triangle_quality` | 0.10 | 0.10 | Aspect ratios, minimum angles, area uniformity |
+| `topology` | 0.10 | 0.10 | Manifoldness, connected components, boundary edges |
+| `normal_consistency` | 0.10 | 0.10 | Smoothness of adjacent face normals |
+| `sheet_switching` | 0.30 | 0.20 | **Detects layer-jumping failures** (the key metric) |
+| `self_intersections` | 0.25 | 0.20 | Self-overlapping geometry (Moller triangle intersection) |
+| `noise` | 0.15 | 0.10 | Statistical outlier vertices (spikes) |
+| `fiber_coherence` | — | 0.10 | Fiber orientation consistency from CT (requires `--volume`) |
+| `layer_distance` | — | 0.10 | Inter-layer spacing consistency from CT (requires `--volume`) |
+| `ct_sheet_switching` | — | 0.00* | CT-informed normal alignment (auto-suppressed, see below) |
 
-Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score is the weighted average. Letter grades: A (>0.9), B (>0.75), C (>0.6), D (>0.4), F.
+*\*ct_sheet_switching is included but auto-weighted to 0 because the structure tensor approach has too high a noise baseline. When noisy CT metrics are detected (structure tensor fallback, <50 samples), their weight is redistributed to reliable metrics.*
+
+**Tier 3** adds `winding_angle` (0.25 weight) when `--umbilicus` is also provided — the most reliable parallel-layer sheet switch detector.
+
+Each metric produces a score from 0.0 (worst) to 1.0 (best). The aggregate score is the weighted average. Letter grades: A (≥0.95), B (≥0.85), C (≥0.70), D (≥0.50), F.
 
 ### Sheet Switching Detection
 
@@ -103,7 +109,32 @@ Uses the Moller (1997) triangle-triangle intersection algorithm instead of AABB 
 
 Mesh-aware statistical outlier detection. Excludes vertices within 3 hops of mesh boundaries before running Open3D's statistical outlier removal — boundary neighborhoods have fewer point cloud neighbors and would otherwise produce false positives.
 
-## Visualization
+## Interactive HTML Review
+
+Generate a standalone HTML page with a 3D viewer, per-metric scoring, and problem cluster diagnostics:
+
+```bash
+# Tier 1: geometry only
+mesh-qa score segment.obj --review review.html
+
+# Tier 2: geometry + CT volume analysis
+mesh-qa score segment.obj --review review.html \
+  --volume 'https://data.aws.ash2txt.org/.../volume.zarr/'
+
+# Tier 3: geometry + CT + winding angle
+mesh-qa score segment.obj --review review.html \
+  --scroll-config configs/PHerc1667.json
+```
+
+The HTML reviewer includes:
+- **5 view modes**: Metric Colors, Deviation Heatmap, CT Texture, Fiber Classes, Winding Angle
+- **Problem cluster sidebar** with cross-section charts and CT slice overlays
+- **Keyboard shortcuts**: 1-5 for view modes, R for reset
+- **Dynamic legend** that updates per view mode
+
+Each view mode has detailed explanations written for scrollprize experts — click a mode to learn what the analysis does and how to interpret the colors.
+
+## PLY Visualization
 
 Export a colored PLY mesh highlighting problem regions:
 
@@ -150,18 +181,17 @@ mesh-qa score segment.obj --weights '{"sheet_switching": 0.5, "noise": 0.05}'
 
 ## Validated On
 
-Validated on bruniss's PHerc1667 (Scroll 4) segments — 3 manual segmentations and 3 autogens with known errors:
+Validated on bruniss's PHerc1667 (Scroll 4) segments — manual segmentations and autogens with known errors:
 
 | Type | Segment | Faces | Score | Grade |
 |------|---------|-------|-------|-------|
-| Manual | 20240413132301 | 134K | 0.921 | A |
-| Manual | 20240415173945 | 76K | 0.908 | A |
-| Manual | 1667segment-1 | 19K | 0.906 | A |
-| Autogen | 02231955 | 595K | 0.803 | B |
-| Autogen | unroll_attempt_1 | 653K | 0.804 | B |
-| Autogen | 02212025 | 615K | 0.771 | B |
+| Official | 20231210121321 | 7.0M | 0.993 | A |
+| Manual | spelufo_PHerc1447 | 76K-134K | 0.964-0.990 | A |
+| Manual | bruniss manual | 19K-134K | 0.956-0.976 | A |
+| Autogen | bruniss autogen (mild) | 595K-653K | 0.826 | C |
+| Autogen | bruniss autogen (bad) | 615K | 0.745 | C |
 
-Clean separation: all manual segments score A (>0.9), all autogens score B (<0.81). The main differentiators are self-intersections (0.000 on all autogens vs 1.000 on manual) and topology. Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method.
+Clean separation: manual/official segments score A (≥0.95), autogens with errors score C. The main differentiators are self-intersections (0.000 on bad autogens vs 1.000 on manual) and topology. Self-intersection detection cross-validated against Open3D's exhaustive `is_self_intersecting()` method.
 
 ## Requirements
 

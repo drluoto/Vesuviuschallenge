@@ -662,9 +662,10 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
               font-size: 11px; margin: 4px 2px; }
 .toggle-btn.active { background: #1a4a7a; color: #fff; border-color: #4488bb; }
 .viewmode-info { background: #0a1a3a; border: 1px solid #1a3a6a; border-radius: 4px;
-                 padding: 8px 10px; margin-top: 6px; font-size: 11px; color: #8ab;
-                 line-height: 1.4; display: none; }
+                 padding: 10px 12px; margin-top: 6px; font-size: 11px; color: #8ab;
+                 line-height: 1.5; display: none; max-height: 200px; overflow-y: auto; }
 .viewmode-info.visible { display: block; }
+.viewmode-info strong { color: #bcd; }
 .cluster-card { background: #0f3460; border-radius: 6px; padding: 10px;
                 margin-bottom: 8px; cursor: pointer; transition: all 0.2s;
                 border-left: 3px solid transparent; }
@@ -700,7 +701,7 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
   <div id="viewer">
     <canvas id="canvas"></canvas>
     <div id="info-overlay">
-      Scroll to zoom | Drag to rotate | Right-drag to pan
+      Scroll to zoom | Drag to rotate | Right-drag to pan | R = reset | 1-5 = view modes
     </div>
   </div>
   <div id="sidebar">
@@ -919,13 +920,45 @@ window.setViewMode = function(mode) {
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
   const btn = document.getElementById('btn-' + mode);
   if (btn) btn.classList.add('active');
-  // Update info box
+  // Update info box with detailed explanations for scrollprize experts
   const descs = {
-    metric: 'Quality per face. Green=good, red=sheet switch, magenta=self-intersect, blue=noise, orange=triangle, yellow=normals.',
-    heatmap: 'Normal deviation heatmap. Green=aligned, yellow=moderate (20deg), red=sharp (40deg+).',
-    ct: 'CT intensity on full-res mesh. Dark=masked, bright=dense. Keys: R=reset, 1-5=views.',
-    fiber: 'Fiber classes. Blue=horizontal, red=vertical, yellow=flip (sheet switch), gray=no data.',
-    winding: 'Winding angle rainbow. Sharp color changes between neighbors = potential sheet switch.'
+    metric: 'Composite quality overlay — each face is colored by its worst-scoring metric. '
+      + 'Green = passes all checks. Red = sheet switching (surface normal flips >15deg between '
+      + 'adjacent faces, suggesting the mesh jumped between papyrus layers). Magenta = self-intersecting '
+      + 'triangles (mesh folds through itself, common in autogen segments). Blue = geometric noise '
+      + '(vertex positions deviate from local surface fit, e.g. from CT reconstruction artifacts). '
+      + 'Orange = poor triangle quality (degenerate aspect ratios or angles <10deg). '
+      + 'Yellow = normal inconsistency (face normals disagree with neighbors). '
+      + 'When metrics overlap, higher-weighted ones take priority.',
+    heatmap: 'Normal deviation angle for each face relative to its 8-ring neighborhood average. '
+      + 'This reveals geometric anomalies independently of the metric thresholds. Green = well-aligned '
+      + '(<5deg deviation, typical for smooth papyrus following a single layer). Yellow = moderate '
+      + 'deviation (15-25deg, could indicate a fold, crinkle, or gradual layer transition). '
+      + 'Red = sharp deviation (>40deg, strong indicator of a sheet switch, tear, or segmentation '
+      + 'artifact). Unlike the metric view, this shows continuous angles rather than binary pass/fail, '
+      + 'so subtle surface kinks that pass metric thresholds are still visible.',
+    ct: 'Raw micro-CT intensity mapped onto the full-resolution mesh (not decimated). Shows the '
+      + 'actual papyrus structure as captured by synchrotron scanning. Dark regions = masked or empty '
+      + 'volume (outside the scanned region or masked during reconstruction). Brightness = CT density '
+      + '(higher density appears brighter). Use this to verify the mesh follows real papyrus — if '
+      + 'the texture shows clean fiber patterns, the segmentation is tracking a real layer. Blurry or '
+      + 'discontinuous texture may indicate the surface is between layers or in a damaged region. '
+      + 'Resolution depends on mesh vertex density vs. the ~8um voxel size.',
+    fiber: 'Fiber orientation classification from CT volume analysis. Each vertex is classified based on '
+      + 'the dominant fiber direction in its local CT neighborhood. Blue = horizontal fibers (parallel to '
+      + 'papyrus sheet plane, typically the writing surface). Red = vertical fibers (perpendicular, typical '
+      + 'of the backing layer in cross-laminated papyrus). Yellow = orientation flip between adjacent '
+      + 'vertices — this is a strong sheet switching indicator, since real papyrus has consistent fiber '
+      + 'direction within a single layer. Gray = no CT data or ambiguous orientation. '
+      + 'Note: if using structure tensor (labeled "approx"), classification is noisier than nnUNet — '
+      + 'expect ~5-10%% baseline flip rate even on good segments.',
+    winding: 'Winding angle around the scroll umbilicus (center axis), computed via BFS traversal from '
+      + 'ThaumatoAnakalyptor\'s method. Rainbow coloring encodes angular position: each color band '
+      + 'represents ~60deg of rotation around the scroll center. Adjacent faces with the same color are on '
+      + 'the same wrapping layer. Sharp color transitions between neighboring faces indicate the surface '
+      + 'jumped to a different layer (sheet switch) — the angular gap tells you how many layers apart. '
+      + 'This is the most reliable sheet switching detector for parallel-layer switches that geometry '
+      + 'alone cannot catch, but requires an accurate umbilicus position. Smooth gradients = good.'
   };
   const info = document.getElementById('viewmode-info');
   if (info && descs[mode]) { info.textContent = descs[mode]; info.classList.add('visible'); }
