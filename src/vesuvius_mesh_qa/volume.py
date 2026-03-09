@@ -59,6 +59,14 @@ class VolumeAccessor:
     def shape(self) -> tuple[int, int, int]:
         return self._shape
 
+    @property
+    def chunks(self) -> tuple[int, int, int]:
+        return self._chunks
+
+    @property
+    def scale_factor(self) -> int:
+        return self._scale_factor
+
     def _xyz_to_zyx(self, vertex_xyz: np.ndarray) -> tuple[int, int, int]:
         """Convert mesh (X, Y, Z) to volume index (iz, iy, ix)."""
         s = self._scale_factor

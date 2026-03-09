@@ -39,7 +39,7 @@ class TestComputeAllMetricsWithVolume:
             mock_ct_cls.return_value = mock_ct_instance
 
             results = compute_all_metrics(perfect_plane, volume_url="s3://fake/volume")
-            assert len(results) == 8  # 6 base + CT + fiber_coherence
+            assert len(results) == 9  # 6 base + CT + fiber_coherence + layer_distance
             metric_names = [r.name for r in results]
             assert "ct_sheet_switching" in metric_names
             mock_va_cls.assert_called_once_with("s3://fake/volume")
@@ -79,8 +79,8 @@ class TestComputeAllMetricsWithVolume:
                 perfect_plane, volume_url="s3://fake/volume", on_progress=on_progress,
             )
 
-        # All progress reports should show total=8 (6 base + CT + fiber)
-        assert all(t == 8 for t in totals_seen), f"Expected all totals=8, got {totals_seen}"
+        # All progress reports should show total=9 (6 base + CT + fiber + layer_distance)
+        assert all(t == 9 for t in totals_seen), f"Expected all totals=9, got {totals_seen}"
 
     def test_progress_callback_total_without_volume(self, perfect_plane):
         """Progress callback should report total=6 when no volume."""

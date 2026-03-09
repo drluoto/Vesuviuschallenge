@@ -9,7 +9,9 @@ distinguish real sheet switches from false positives.
 from __future__ import annotations
 
 import base64
+import html as html_mod
 import json
+import logging
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +20,8 @@ import open3d as o3d
 from vesuvius_mesh_qa.metrics.base import MetricResult
 from vesuvius_mesh_qa.metrics.normals import _build_face_adjacency_sparse
 from vesuvius_mesh_qa.metrics.winding_angle import compute_winding_angles_bfs, load_umbilicus
+
+logger = logging.getLogger(__name__)
 
 # Maximum faces for the HTML viewer (decimate larger meshes)
 MAX_VIEWER_FACES = 200_000
@@ -233,14 +237,15 @@ def _build_vertex_colors_ct_texture(
     try:
         vol = VolumeAccessor(volume_url, scale=1, cache_chunks=256)
     except Exception:
+        logger.debug("Failed to open volume at %s", volume_url, exc_info=True)
         return None
 
     vertices = np.asarray(mesh.vertices)
     n_verts = len(vertices)
     intensities = np.full(n_verts, -1.0, dtype=np.float32)
-    shape = vol._shape  # (Z, Y, X)
-    chunks = vol._chunks  # (cz, cy, cx)
-    scale = vol._scale_factor  # 1 for scale=0
+    shape = vol.shape  # (Z, Y, X)
+    chunks = vol.chunks  # (cz, cy, cx)
+    scale = vol.scale_factor
 
     # Convert all vertices to volume indices at once
     voxels_x = np.round(vertices[:, 0] / scale).astype(np.int64)
@@ -268,6 +273,7 @@ def _build_vertex_colors_ct_texture(
         try:
             chunk_data = vol._fetch_chunk(cz, cy, cx)
         except Exception:
+            logger.debug("Failed to fetch chunk (%d,%d,%d)", cz, cy, cx, exc_info=True)
             continue
         gz0 = cz * chunks[0]
         gy0 = cy * chunks[1]
@@ -319,6 +325,27 @@ def _build_vertex_colors_ct_texture(
     return colors
 
 
+def _scatter_face_to_vertex(
+    triangles: np.ndarray, face_colors: np.ndarray, n_verts: int
+) -> np.ndarray:
+    """Average face colors onto vertices using sparse incidence matrix."""
+    from scipy import sparse
+
+    n_faces = len(triangles)
+    rows = triangles.ravel()
+    cols = np.repeat(np.arange(n_faces), 3)
+    incidence = sparse.csr_matrix(
+        (np.ones(len(rows)), (rows, cols)), shape=(n_verts, n_faces)
+    )
+    vertex_colors = np.zeros((n_verts, 3), dtype=np.float64)
+    for ch in range(3):
+        vertex_colors[:, ch] = incidence.dot(face_colors[:, ch])
+    vertex_counts = np.array(incidence.sum(axis=1)).ravel()
+    mask = vertex_counts > 0
+    vertex_colors[mask] /= vertex_counts[mask, np.newaxis]
+    return vertex_colors
+
+
 def _build_vertex_colors_heatmap(
     mesh: o3d.geometry.TriangleMesh,
     deviation_deg: np.ndarray,
@@ -337,14 +364,7 @@ def _build_vertex_colors_heatmap(
     face_colors[:, 1] = np.clip(2.0 - t * 2.0, 0, 1) * 255  # G
     face_colors[:, 2] = 0  # B
 
-    vertex_colors = np.zeros((n_verts, 3), dtype=np.float64)
-    vertex_counts = np.zeros(n_verts, dtype=np.float64)
-    for fi in range(n_faces):
-        for vi in triangles[fi]:
-            vertex_colors[vi] += face_colors[fi]
-            vertex_counts[vi] += 1.0
-    nonzero = vertex_counts > 0
-    vertex_colors[nonzero] /= vertex_counts[nonzero, np.newaxis]
+    vertex_colors = _scatter_face_to_vertex(triangles, face_colors, n_verts)
     return vertex_colors.astype(np.uint8)
 
 
@@ -374,14 +394,7 @@ def _build_vertex_colors(
         face_colors[faces_to_paint] = color
         face_priority[faces_to_paint] = r.weight
 
-    vertex_colors = np.zeros((n_verts, 3), dtype=np.float64)
-    vertex_counts = np.zeros(n_verts, dtype=np.float64)
-    for fi in range(n_faces):
-        for vi in triangles[fi]:
-            vertex_colors[vi] += face_colors[fi]
-            vertex_counts[vi] += 1.0
-    nonzero = vertex_counts > 0
-    vertex_colors[nonzero] /= vertex_counts[nonzero, np.newaxis]
+    vertex_colors = _scatter_face_to_vertex(triangles, face_colors, n_verts)
     return vertex_colors.astype(np.uint8)
 
 
@@ -711,15 +724,14 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
     <div id="clusters">%(clusters_html)s</div>
     <div class="legend">
       <h2>Legend</h2>
-      <div class="legend-item"><div class="legend-swatch" style="background:#b4dcb4"></div>Good</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#ff0000"></div>Sheet switching</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#ff00ff"></div>Self-intersections</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#0080ff"></div>Noise</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#ffa500"></div>Triangle quality</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#ffff00"></div>Normal consistency</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#3264dc"></div>Horizontal fibers (fiber view)</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#dc3232"></div>Vertical fibers (fiber view)</div>
-      <div class="legend-item"><div class="legend-swatch" style="background:#ffdc32"></div>Fiber class flip (fiber view)</div>
+      <div id="legend-content">
+        <div class="legend-item"><div class="legend-swatch" style="background:#b4dcb4"></div>Good</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ff0000"></div>Sheet switching</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ff00ff"></div>Self-intersections</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#0080ff"></div>Noise</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ffa500"></div>Triangle quality</div>
+        <div class="legend-item"><div class="legend-swatch" style="background:#ffff00"></div>Normal consistency</div>
+      </div>
     </div>
   </div>
 </div>
@@ -731,6 +743,11 @@ h2 { font-size: 13px; margin: 16px 0 8px; color: #aaa; text-transform: uppercase
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+if (!THREE || !THREE.Scene) {
+  document.getElementById('viewer').textContent = 'Failed to load Three.js from CDN. Check your internet connection.';
+  throw new Error('Three.js failed to load');
+}
 
 const posB64 = "%(positions_b64)s";
 const idxB64 = "%(indices_b64)s";
@@ -855,6 +872,10 @@ controls.target.copy(center);
 controls.enableDamping = true; controls.dampingFactor = 0.1;
 controls.update();
 
+// Save initial camera state for reset
+const initialCamPos = camera.position.clone();
+const initialTarget = controls.target.clone();
+
 function onResize() {
   const w = viewer.clientWidth, h = viewer.clientHeight;
   renderer.setSize(w, h);
@@ -890,7 +911,6 @@ window.setViewMode = function(mode) {
     if (mode === 'heatmap') src = colHeatmap;
     else if (mode === 'winding' && colWinding) src = colWinding;
     else if (mode === 'fiber' && colFiber) src = colFiber;
-    else if (mode === 'ct' && colCt) src = colCt;  // fallback if no separate CT geom
     const arr = colorAttr.array;
     for (let i = 0; i < arr.length; i++) arr[i] = src[i];
     colorAttr.needsUpdate = true;
@@ -901,15 +921,40 @@ window.setViewMode = function(mode) {
   if (btn) btn.classList.add('active');
   // Update info box
   const descs = {
-    metric: 'Per-face quality coloring. Green = good, red = sheet switching, magenta = self-intersections, blue = noise, orange = poor triangle quality, yellow = normal inconsistency.',
-    heatmap: 'Normal deviation angle heatmap. Shows how much each face normal deviates from the 8-ring neighborhood average. Green = aligned (0deg), yellow = moderate (20deg), red = sharp deviation (40deg+). Highlights geometric anomalies and surface kinks.',
-    ct: 'CT volume intensity mapped onto the full-resolution mesh (not decimated). Shows actual papyrus structure from the micro-CT scan. Dark regions = masked/empty volume. Brightness = CT density. Visible texture depends on mesh vertex density and CT data coverage.',
-    fiber: 'Fiber orientation classes from structure tensor analysis of the CT volume. Blue = horizontal fibers, red = vertical fibers, yellow = class flip between neighbors (potential sheet switch). Gray = unclassified or no CT data.',
-    winding: 'Winding angle around the scroll umbilicus (center axis). Rainbow coloring shows angular position: faces at similar angles are same color. Sharp color transitions between adjacent faces indicate potential sheet switching where the surface jumps between wrapping layers.'
+    metric: 'Quality per face. Green=good, red=sheet switch, magenta=self-intersect, blue=noise, orange=triangle, yellow=normals.',
+    heatmap: 'Normal deviation heatmap. Green=aligned, yellow=moderate (20deg), red=sharp (40deg+).',
+    ct: 'CT intensity on full-res mesh. Dark=masked, bright=dense. Keys: R=reset, 1-5=views.',
+    fiber: 'Fiber classes. Blue=horizontal, red=vertical, yellow=flip (sheet switch), gray=no data.',
+    winding: 'Winding angle rainbow. Sharp color changes between neighbors = potential sheet switch.'
   };
   const info = document.getElementById('viewmode-info');
   if (info && descs[mode]) { info.textContent = descs[mode]; info.classList.add('visible'); }
   else if (info) { info.classList.remove('visible'); }
+  // Update legend for current mode
+  const legendEl = document.getElementById('legend-content');
+  if (legendEl) {
+    const legends = {
+      metric: [['#b4dcb4','Good'],['#ff0000','Sheet switching'],['#ff00ff','Self-intersections'],['#0080ff','Noise'],['#ffa500','Triangle quality'],['#ffff00','Normal consistency']],
+      heatmap: [['#00ff00','Aligned (0deg)'],['#ffff00','Moderate (20deg)'],['#ff0000','Sharp (40deg+)']],
+      ct: [['#1e140a','Masked/empty'],['#ffe6b9','High density']],
+      fiber: [['#3264dc','Horizontal'],['#dc3232','Vertical'],['#ffdc32','Class flip'],['#808080','No data']],
+      winding: [['#ff0000','0deg'],['#ffff00','60deg'],['#00ff00','120deg'],['#00ffff','180deg'],['#0000ff','240deg'],['#ff00ff','300deg']]
+    };
+    const items = legends[mode] || legends.metric;
+    while (legendEl.firstChild) legendEl.removeChild(legendEl.firstChild);
+    items.forEach(([color, label]) => {
+      const row = document.createElement('div');
+      row.className = 'legend-item';
+      const swatch = document.createElement('div');
+      swatch.className = 'legend-swatch';
+      swatch.style.background = color;
+      const text = document.createTextNode(label);
+      row.appendChild(swatch);
+      row.appendChild(text);
+      legendEl.appendChild(row);
+    });
+  }
+  if (typeof render === 'function') render();
 };
 // Set initial info for default mode
 window.setViewMode('metric');
@@ -988,6 +1033,7 @@ function focusCluster(idx) {
     camera.position.lerpVectors(startPos, newPos, ease);
     controls.target.lerpVectors(startTarget, target, ease);
     controls.update();
+    render();
     if (t < 1) requestAnimationFrame(anim);
   }
   requestAnimationFrame(anim);
@@ -1005,16 +1051,140 @@ document.querySelectorAll('.cluster-card').forEach(el => {
   el.addEventListener('click', () => focusCluster(parseInt(el.dataset.idx)));
 });
 
-// Animation loop
-function animate() {
-  requestAnimationFrame(animate);
-  controls.update();
-  renderer.render(scene, camera);
+// Render cross-section charts on load
+clusters.forEach((c, i) => {
+  if (c.cross_section) drawCrossSection('chart-' + i, c.cross_section);
+});
+
+// Render CT cross-section slices
+function drawCtSlice(canvasId, sliceB64, sliceSize, pts) {
+  const cvs = document.getElementById(canvasId);
+  if (!cvs) return;
+  const ctx = cvs.getContext('2d');
+  const raw = Uint8Array.from(atob(sliceB64), c => c.charCodeAt(0));
+  const imgData = ctx.createImageData(sliceSize, sliceSize);
+  for (let i = 0; i < raw.length; i++) {
+    imgData.data[i*4] = raw[i];
+    imgData.data[i*4+1] = raw[i];
+    imgData.data[i*4+2] = raw[i];
+    imgData.data[i*4+3] = 255;
+  }
+  ctx.putImageData(imgData, 0, 0);
+  if (pts && pts.x) {
+    ctx.fillStyle = 'rgba(0, 255, 100, 0.5)';
+    for (let i = 0; i < pts.x.length; i++) {
+      const px = pts.x[i], py = pts.y[i];
+      if (px >= 0 && px < sliceSize && py >= 0 && py < sliceSize) {
+        ctx.fillRect(px - 0.5, py - 0.5, 1, 1);
+      }
+    }
+  }
 }
-animate();
+clusters.forEach((c, i) => {
+  if (c.ct_slice_b64) drawCtSlice('ct-slice-' + i, c.ct_slice_b64, c.ct_slice_size || 128, c.ct_slice_pts);
+});
+
+// On-demand rendering (no animation loop — saves power)
+function render() { renderer.render(scene, camera); }
+controls.addEventListener('change', render);
+window.addEventListener('resize', () => { onResize(); render(); });
+render();
+
+// Reset view
+window.resetView = function() {
+  camera.position.copy(initialCamPos);
+  controls.target.copy(initialTarget);
+  controls.update();
+  render();
+};
+
+// Keyboard shortcuts
+document.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA') return;
+  const key = e.key.toLowerCase();
+  if (key === 'r') resetView();
+  else if (key === '1') setViewMode('metric');
+  else if (key === '2') setViewMode('heatmap');
+  else if (key === '3') setViewMode('ct');
+  else if (key === '4') setViewMode('fiber');
+  else if (key === '5') setViewMode('winding');
+});
 </script>
 </body>
 </html>"""
+
+
+def _add_ct_slices_to_clusters(
+    clusters: list[dict],
+    mesh: o3d.geometry.TriangleMesh,
+    volume_url: str,
+    slice_size: int = 128,
+) -> None:
+    """Add CT cross-section slice data to cluster dicts (in place).
+
+    For each cluster, samples a Z-aligned slice from the CT volume at the
+    cluster centroid, finds mesh vertices near that Z level, and adds
+    the slice image and mesh intersection points to the cluster dict.
+    """
+    from vesuvius_mesh_qa.volume import VolumeAccessor
+
+    try:
+        vol = VolumeAccessor(volume_url, scale=1, cache_chunks=64)
+    except Exception:
+        logger.debug("Failed to open volume for CT slices", exc_info=True)
+        return
+
+    vertices = np.asarray(mesh.vertices)
+    half = slice_size // 2
+
+    for cluster in clusters[:10]:  # Limit to first 10 clusters
+        cx, cy, cz = cluster["centroid"]
+        s = vol.scale_factor
+        iz = int(round(cz / s))
+        iy = int(round(cy / s))
+        ix = int(round(cx / s))
+
+        # Check bounds
+        shape = vol.shape
+        if not (half <= iz < shape[0] - 1 and
+                half <= iy < shape[1] - half and
+                half <= ix < shape[2] - half):
+            continue
+
+        try:
+            # Sample a Z-slice (Y-X plane at iz)
+            raw = np.array(
+                vol._vol[iz, iy - half:iy + half, ix - half:ix + half],
+                dtype=np.float32,
+            )
+            if raw.shape != (slice_size, slice_size):
+                continue
+            if raw.max() <= 0:
+                continue
+
+            # Normalize to 0-255
+            p2, p98 = np.percentile(raw[raw > 0], [2, 98]) if np.any(raw > 0) else (0, 1)
+            if p98 <= p2:
+                continue
+            norm = np.clip((raw - p2) / (p98 - p2) * 255, 0, 255).astype(np.uint8)
+
+            # Encode as base64
+            slice_b64 = base64.b64encode(norm.tobytes()).decode("ascii")
+
+            # Find mesh vertices near this Z-slice (within ±2 voxels)
+            z_tol = 2.0 * s
+            near_z = np.abs(vertices[:, 2] - cz) < z_tol
+            near_verts = vertices[near_z]
+            # Project to slice-local coordinates
+            pts_x = ((near_verts[:, 0] / s - (ix - half))).tolist()
+            pts_y = ((near_verts[:, 1] / s - (iy - half))).tolist()
+
+            cluster["ct_slice_b64"] = slice_b64
+            cluster["ct_slice_size"] = slice_size
+            cluster["ct_slice_pts"] = {"x": pts_x, "y": pts_y}
+        except Exception:
+            logger.debug("Failed to sample CT slice for cluster", exc_info=True)
+            continue
 
 
 def export_html_review(
@@ -1050,7 +1220,11 @@ def export_html_review(
             tris = np.asarray(mesh.triangles)
             winding_angles = compute_winding_angles_bfs(verts, tris, umb_func)
         except Exception:
-            pass  # Gracefully degrade — no winding angle view
+            logger.debug("Winding angle computation failed", exc_info=True)
+
+    # Enrich clusters with CT cross-section slices if volume available
+    if volume_url and clusters:
+        _add_ct_slices_to_clusters(clusters, mesh, volume_url)
 
     # Build fiber class colors (from metric results, no volume access needed)
     colors_fiber_orig = _build_vertex_colors_fiber(mesh, results)
@@ -1091,17 +1265,28 @@ def export_html_review(
         colors_fiber = colors_fiber_orig  # Same mesh, no remapping needed
 
     # Build CT texture on the ORIGINAL mesh (full resolution for texture detail)
+    # Cap at 500K faces to keep HTML file size manageable
+    MAX_CT_FACES = 500_000
     colors_ct = None
     ct_positions_b64 = ""
     ct_indices_b64 = ""
     if volume_url:
-        console_msg = "Building CT texture on original mesh"
         colors_ct = _build_vertex_colors_ct_texture(mesh, volume_url)
         if colors_ct is not None:
-            ct_verts = np.asarray(mesh.vertices).astype(np.float32)
-            ct_tris = np.asarray(mesh.triangles).astype(np.uint32)
+            ct_mesh = mesh
+            ct_colors = colors_ct
+            n_ct_faces = len(mesh.triangles)
+            if n_ct_faces > MAX_CT_FACES:
+                ct_mesh, _ = _decimate_if_needed(mesh, MAX_CT_FACES)
+                import scipy.spatial
+                tree = scipy.spatial.cKDTree(np.asarray(mesh.vertices))
+                _, nearest = tree.query(np.asarray(ct_mesh.vertices))
+                ct_colors = colors_ct[nearest]
+            ct_verts = np.asarray(ct_mesh.vertices).astype(np.float32)
+            ct_tris = np.asarray(ct_mesh.triangles).astype(np.uint32)
             ct_positions_b64 = _encode_array(ct_verts.ravel())
             ct_indices_b64 = _encode_array(ct_tris.ravel())
+            colors_ct = ct_colors
 
     vertices = np.asarray(view_mesh.vertices).astype(np.float32)
     triangles = np.asarray(view_mesh.triangles).astype(np.uint32)
@@ -1159,7 +1344,9 @@ def export_html_review(
                 f'at ({cx:.0f}, {cy:.0f}, {cz:.0f})</div>'
                 f'<div class="cluster-chart">'
                 f'<canvas id="chart-{i}" width="330" height="120"></canvas></div>'
-                f'</div>'
+                + (f'<div class="cluster-chart"><canvas id="ct-slice-{i}" width="128" height="128" style="image-rendering:pixelated"></canvas></div>'
+                   if c.get("ct_slice_b64") else '')
+                + '</div>'
             )
     else:
         clusters_html = '<div class="no-clusters">No problem clusters detected</div>'
@@ -1174,12 +1361,18 @@ def export_html_review(
     if colors_ct is not None:
         view_buttons += '<button class="toggle-btn" id="btn-ct" onclick="setViewMode(\'ct\')">CT Texture</button>'
     if colors_fiber is not None:
-        view_buttons += '<button class="toggle-btn" id="btn-fiber" onclick="setViewMode(\'fiber\')">Fiber Classes</button>'
+        fiber_label = "Fiber Classes"
+        fiber_result = next((r for r in results if r.name == "fiber_coherence"), None)
+        if fiber_result and fiber_result.details.get("method", "").startswith("structure_tensor"):
+            fiber_label = "Fiber (approx)"
+        view_buttons += f'<button class="toggle-btn" id="btn-fiber" onclick="setViewMode(\'fiber\')">{fiber_label}</button>'
     if colors_winding is not None:
         view_buttons += '<button class="toggle-btn" id="btn-winding" onclick="setViewMode(\'winding\')">Winding Angle</button>'
+    view_buttons += '<button class="toggle-btn" onclick="resetView()">Reset View</button>'
+    view_buttons += '<button class="toggle-btn" disabled title="Coming soon">Compare</button>'
 
     html = HTML_TEMPLATE % {
-        "title": title,
+        "title": html_mod.escape(title),
         "aggregate_fmt": f"{aggregate:.3f}",
         "grade": grade,
         "grade_class": grade_class,
@@ -1202,3 +1395,8 @@ def export_html_review(
 
     output_path = Path(output_path)
     output_path.write_text(html, encoding="utf-8")
+
+
+def export_comparison_html() -> None:
+    """Export a comparison view of two meshes (not yet implemented)."""
+    raise NotImplementedError("Comparison mode is not yet implemented")

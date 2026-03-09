@@ -60,14 +60,17 @@ def export_visualization(
         face_priority[faces_to_paint] = r.weight
 
     # Convert face colors to vertex colors by averaging incident face colors
+    from scipy import sparse
+
+    rows = triangles.ravel()
+    cols = np.repeat(np.arange(n_faces), 3)
+    incidence = sparse.csr_matrix(
+        (np.ones(len(rows)), (rows, cols)), shape=(n_verts, n_faces)
+    )
     vertex_colors = np.zeros((n_verts, 3), dtype=np.float64)
-    vertex_counts = np.zeros(n_verts, dtype=np.float64)
-
-    for fi in range(n_faces):
-        for vi in triangles[fi]:
-            vertex_colors[vi] += face_colors[fi]
-            vertex_counts[vi] += 1.0
-
+    for ch in range(3):
+        vertex_colors[:, ch] = incidence.dot(face_colors[:, ch])
+    vertex_counts = np.array(incidence.sum(axis=1)).ravel()
     nonzero = vertex_counts > 0
     vertex_colors[nonzero] /= vertex_counts[nonzero, np.newaxis]
 

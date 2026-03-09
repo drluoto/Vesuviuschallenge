@@ -14,6 +14,7 @@ from vesuvius_mesh_qa.metrics.intersections import SelfIntersectionMetric
 from vesuvius_mesh_qa.metrics.noise import NoiseMetric
 from vesuvius_mesh_qa.metrics.ct_switching import CTSheetSwitchingMetric
 from vesuvius_mesh_qa.metrics.fiber_coherence import FiberCoherenceMetric
+from vesuvius_mesh_qa.metrics.layer_distance import LayerDistanceMetric
 from vesuvius_mesh_qa.metrics.winding_angle import WindingAngleMetric, load_umbilicus
 from vesuvius_mesh_qa.volume import VolumeAccessor
 
@@ -45,8 +46,9 @@ TIER_WEIGHTS: dict[str, dict[str, float]] = {
         "sheet_switching": 0.20,
         "self_intersections": 0.20,
         "noise": 0.10,
-        "ct_sheet_switching": 0.05,
-        "fiber_coherence": 0.15,
+        "ct_sheet_switching": 0.00,
+        "fiber_coherence": 0.10,
+        "layer_distance": 0.10,
     },
     "tier3": {
         "triangle_quality": 0.05,
@@ -55,11 +57,35 @@ TIER_WEIGHTS: dict[str, dict[str, float]] = {
         "sheet_switching": 0.15,
         "self_intersections": 0.15,
         "noise": 0.05,
-        "ct_sheet_switching": 0.05,
-        "fiber_coherence": 0.15,
+        "ct_sheet_switching": 0.00,
+        "fiber_coherence": 0.10,
+        "layer_distance": 0.10,
         "winding_angle": 0.25,
     },
 }
+
+
+def _suppress_noisy_metrics(results: list[MetricResult]) -> None:
+    """Zero-weight metrics that lack reliable data, then redistribute."""
+    # Suppress CT metrics when fiber coherence fell back to structure tensor
+    fiber = next((r for r in results if r.name == "fiber_coherence"), None)
+    if fiber is not None and fiber.details.get("method", "").startswith("structure_tensor"):
+        for r in results:
+            if r.name in ("ct_sheet_switching", "fiber_coherence"):
+                r.weight = 0.0
+
+    # Suppress any metric with too few samples
+    for r in results:
+        if r.details.get("n_sampled", float("inf")) < 50:
+            r.weight = 0.0
+
+    # Redistribute remaining weights to sum to 1.0
+    total = sum(r.weight for r in results)
+    if 0 < total < 1.0:
+        scale = 1.0 / total
+        for r in results:
+            if r.weight > 0:
+                r.weight *= scale
 
 
 def _detect_tier(has_volume: bool, has_umbilicus: bool) -> str:
@@ -110,6 +136,8 @@ def compute_all_metrics(
             fiber_predictions_url=fiber_predictions_url,
         )
         metrics.append(fiber_metric)
+        layer_metric = LayerDistanceMetric(accessor)
+        metrics.append(layer_metric)
 
     if umbilicus is not None:
         umb_func = load_umbilicus(umbilicus)
@@ -134,6 +162,7 @@ def compute_all_metrics(
         result = metric.compute(mesh)
         results.append(result)
         gc.collect()
+    _suppress_noisy_metrics(results)
     return results
 
 
@@ -147,12 +176,12 @@ def aggregate_score(results: list[MetricResult]) -> float:
 
 def letter_grade(score: float) -> str:
     """Convert a 0-1 score to a letter grade."""
-    if score > 0.9:
+    if score >= 0.95:
         return "A"
-    if score > 0.75:
+    if score >= 0.85:
         return "B"
-    if score > 0.6:
+    if score >= 0.70:
         return "C"
-    if score > 0.4:
+    if score >= 0.50:
         return "D"
     return "F"
