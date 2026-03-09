@@ -218,28 +218,33 @@ def _build_vertex_colors_ct_texture(
     mesh: o3d.geometry.TriangleMesh,
     volume_url: str,
 ) -> np.ndarray | None:
-    """Build per-vertex grayscale colors from CT volume intensity.
+    """Build per-vertex colors from CT volume at high resolution.
 
-    Samples the CT intensity at each vertex position using batch chunk
-    reads for efficiency. Maps to warm papyrus-like color tones.
+    Uses scale=1 (half-resolution, ~15.8µm/voxel) on the original mesh
+    (not decimated) to capture fiber-level detail. Papyrus fibers are
+    100-200µm apart = 6-13 voxels at this scale. With ~548K vertices
+    and ~80µm triangle edges, each edge spans ~5 voxels — enough to
+    resolve individual fibers and layer boundaries.
+
+    Chunk reads are vectorized: vertices grouped by chunk key, all values
+    extracted per chunk in one pass via numpy fancy indexing.
+
     Returns None if volume is unavailable or has no data at mesh positions.
     """
     from collections import defaultdict
     from vesuvius_mesh_qa.volume import VolumeAccessor
 
     try:
-        # Use scale=2 (quarter-resolution) for faster remote reads.
-        # Visual quality is still good — each voxel covers 4x4x4 original voxels.
-        vol = VolumeAccessor(volume_url, scale=2, cache_chunks=2048)
+        vol = VolumeAccessor(volume_url, scale=1, cache_chunks=256)
     except Exception:
         return None
 
     vertices = np.asarray(mesh.vertices)
     n_verts = len(vertices)
-    intensities = np.zeros(n_verts, dtype=np.float32)
+    intensities = np.full(n_verts, -1.0, dtype=np.float32)
     shape = vol._shape  # (Z, Y, X)
     chunks = vol._chunks  # (cz, cy, cx)
-    scale = vol._scale_factor
+    scale = vol._scale_factor  # 1 for scale=0
 
     # Convert all vertices to volume indices at once
     voxels_x = np.round(vertices[:, 0] / scale).astype(np.int64)
@@ -261,23 +266,35 @@ def _build_vertex_colors_ct_texture(
         cx = int(voxels_x[i] // chunks[2])
         chunk_groups[(cz, cy, cx)].append(i)
 
-    # Batch-read each chunk and extract all vertex values at once
+    # Batch-read each chunk and extract all vertex values via numpy fancy indexing
     n_valid = 0
     for (cz, cy, cx), vert_indices in chunk_groups.items():
         try:
             chunk_data = vol._fetch_chunk(cz, cy, cx)
         except Exception:
             continue
-        gz0, gy0, gx0 = cz * chunks[0], cy * chunks[1], cx * chunks[2]
-        for i in vert_indices:
-            lz = int(voxels_z[i]) - gz0
-            ly = int(voxels_y[i]) - gy0
-            lx = int(voxels_x[i]) - gx0
-            if 0 <= lz < chunk_data.shape[0] and 0 <= ly < chunk_data.shape[1] and 0 <= lx < chunk_data.shape[2]:
-                val = float(chunk_data[lz, ly, lx])
-                intensities[i] = val
-                if val > 0:
-                    n_valid += 1
+        gz0 = cz * chunks[0]
+        gy0 = cy * chunks[1]
+        gx0 = cx * chunks[2]
+
+        vis = np.array(vert_indices, dtype=np.intp)
+        lz = voxels_z[vis].astype(np.intp) - gz0
+        ly = voxels_y[vis].astype(np.intp) - gy0
+        lx = voxels_x[vis].astype(np.intp) - gx0
+
+        # Clamp to chunk bounds
+        valid = (
+            (lz >= 0) & (lz < chunk_data.shape[0]) &
+            (ly >= 0) & (ly < chunk_data.shape[1]) &
+            (lx >= 0) & (lx < chunk_data.shape[2])
+        )
+        if not np.any(valid):
+            continue
+
+        vis_ok = vis[valid]
+        vals = chunk_data[lz[valid], ly[valid], lx[valid]]
+        intensities[vis_ok] = vals
+        n_valid += int(np.sum(vals > 0))
 
     if n_valid < 10:
         return None
@@ -291,16 +308,17 @@ def _build_vertex_colors_ct_texture(
         return None
     norm = np.clip((intensities - p2) / (p98 - p2), 0.0, 1.0)
 
-    # Map to warm papyrus tones: dark brown -> tan -> cream
+    # High-contrast grayscale for maximum texture visibility.
+    # MeshBasicMaterial (no lighting) renders these values exactly.
     colors = np.zeros((n_verts, 3), dtype=np.uint8)
-    # Masked/zero regions -> dark background
-    zero_mask = intensities == 0
-    colors[zero_mask] = [30, 25, 20]
-    # Non-zero: warm grayscale
+    # Masked/zero regions -> very dark
+    zero_mask = intensities <= 0
+    colors[zero_mask] = [10, 8, 6]
+    # Non-zero: high-contrast warm grayscale (dark brown → cream)
     nz = ~zero_mask
-    colors[nz, 0] = (40 + norm[nz] * 195).astype(np.uint8)  # R: 40-235
-    colors[nz, 1] = (30 + norm[nz] * 175).astype(np.uint8)  # G: 30-205
-    colors[nz, 2] = (20 + norm[nz] * 145).astype(np.uint8)  # B: 20-165
+    colors[nz, 0] = (30 + norm[nz] * 225).astype(np.uint8)   # R: 30-255
+    colors[nz, 1] = (20 + norm[nz] * 210).astype(np.uint8)   # G: 20-230
+    colors[nz, 2] = (10 + norm[nz] * 175).astype(np.uint8)   # B: 10-185
 
     return colors
 
@@ -720,6 +738,8 @@ const colHeatmapB64 = "%(colors_heatmap_b64)s";
 const colWindingB64 = "%(colors_winding_b64)s";
 const colFiberB64 = "%(colors_fiber_b64)s";
 const colCtB64 = "%(colors_ct_b64)s";
+const ctPosB64 = "%(ct_positions_b64)s";
+const ctIdxB64 = "%(ct_indices_b64)s";
 const clusters = %(clusters_json)s;
 
 function b64ToFloat32(b64) {
@@ -786,11 +806,31 @@ const colorAttr = new THREE.BufferAttribute(colMetric.slice(), 3);
 geometry.setAttribute('color', colorAttr);
 geometry.computeVertexNormals();
 
-const material = new THREE.MeshPhongMaterial({
+const matLit = new THREE.MeshPhongMaterial({
   vertexColors: true, side: THREE.DoubleSide, shininess: 20, specular: 0x222222
 });
-const meshObj = new THREE.Mesh(geometry, material);
+const matUnlit = new THREE.MeshBasicMaterial({
+  vertexColors: true, side: THREE.DoubleSide
+});
+const meshObj = new THREE.Mesh(geometry, matLit);
 scene.add(meshObj);
+
+// CT texture uses separate full-resolution geometry for detail
+let ctMeshObj = null;
+if (ctPosB64 && colCtRaw) {
+  const ctPositions = b64ToFloat32(ctPosB64);
+  const ctIndices = b64ToUint32(ctIdxB64);
+  const ctGeom = new THREE.BufferGeometry();
+  ctGeom.setAttribute('position', new THREE.BufferAttribute(ctPositions, 3));
+  ctGeom.setIndex(new THREE.BufferAttribute(ctIndices, 1));
+  const ctColorArr = new Float32Array(colCtRaw.length);
+  for (let i = 0; i < colCtRaw.length; i++) ctColorArr[i] = colCtRaw[i] / 255.0;
+  ctGeom.setAttribute('color', new THREE.BufferAttribute(ctColorArr, 3));
+  ctGeom.computeVertexNormals();
+  ctMeshObj = new THREE.Mesh(ctGeom, matUnlit);
+  ctMeshObj.visible = false;
+  scene.add(ctMeshObj);
+}
 
 geometry.computeBoundingBox();
 const bbox = geometry.boundingBox;
@@ -835,14 +875,26 @@ clusters.forEach((c, i) => {
 
 // View mode toggle
 window.setViewMode = function(mode) {
-  let src = colMetric;
-  if (mode === 'heatmap') src = colHeatmap;
-  else if (mode === 'winding' && colWinding) src = colWinding;
-  else if (mode === 'fiber' && colFiber) src = colFiber;
-  else if (mode === 'ct' && colCt) src = colCt;
-  const arr = colorAttr.array;
-  for (let i = 0; i < arr.length; i++) arr[i] = src[i];
-  colorAttr.needsUpdate = true;
+  // Hide cluster markers in CT mode (they obscure texture)
+  markerGroup.visible = (mode !== 'ct');
+  if (mode === 'ct' && ctMeshObj) {
+    // CT mode: show full-resolution CT mesh, hide decimated mesh
+    meshObj.visible = false;
+    ctMeshObj.visible = true;
+  } else {
+    // Other modes: show decimated mesh with appropriate colors
+    meshObj.visible = true;
+    if (ctMeshObj) ctMeshObj.visible = false;
+    let src = colMetric;
+    if (mode === 'heatmap') src = colHeatmap;
+    else if (mode === 'winding' && colWinding) src = colWinding;
+    else if (mode === 'fiber' && colFiber) src = colFiber;
+    else if (mode === 'ct' && colCt) src = colCt;  // fallback if no separate CT geom
+    const arr = colorAttr.array;
+    for (let i = 0; i < arr.length; i++) arr[i] = src[i];
+    colorAttr.needsUpdate = true;
+    meshObj.material = matLit;
+  }
   document.querySelectorAll('.toggle-btn').forEach(b => b.classList.remove('active'));
   const btn = document.getElementById('btn-' + mode);
   if (btn) btn.classList.add('active');
@@ -1023,10 +1075,18 @@ def export_html_review(
             colors_winding = None
         colors_fiber = colors_fiber_orig  # Same mesh, no remapping needed
 
-    # Build CT texture on the decimated mesh directly (much fewer vertices)
+    # Build CT texture on the ORIGINAL mesh (full resolution for texture detail)
     colors_ct = None
+    ct_positions_b64 = ""
+    ct_indices_b64 = ""
     if volume_url:
-        colors_ct = _build_vertex_colors_ct_texture(view_mesh, volume_url)
+        console_msg = "Building CT texture on original mesh"
+        colors_ct = _build_vertex_colors_ct_texture(mesh, volume_url)
+        if colors_ct is not None:
+            ct_verts = np.asarray(mesh.vertices).astype(np.float32)
+            ct_tris = np.asarray(mesh.triangles).astype(np.uint32)
+            ct_positions_b64 = _encode_array(ct_verts.ravel())
+            ct_indices_b64 = _encode_array(ct_tris.ravel())
 
     vertices = np.asarray(view_mesh.vertices).astype(np.float32)
     triangles = np.asarray(view_mesh.triangles).astype(np.uint32)
@@ -1119,6 +1179,8 @@ def export_html_review(
         "colors_winding_b64": colors_winding_b64,
         "colors_fiber_b64": colors_fiber_b64,
         "colors_ct_b64": colors_ct_b64,
+        "ct_positions_b64": ct_positions_b64,
+        "ct_indices_b64": ct_indices_b64,
         "clusters_json": clusters_json,
         "view_buttons": view_buttons,
     }
